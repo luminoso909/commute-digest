@@ -9,7 +9,7 @@ from time import sleep
 
 from .schedule import BEIJING, MORNING_TIME, next_slot
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def next_run(now: datetime, first_date: date | None = None) -> datetime:

@@ -14,5 +14,5 @@ DerivedData/
 data/
 /static/widget-latest.json
 /static/.widget-latest.*
-/commute_digest/static/widget-latest.json
-/commute_digest/static/.widget-latest.*
+/src/commute_digest/static/widget-latest.json
+/src/commute_digest/static/.widget-latest.*
