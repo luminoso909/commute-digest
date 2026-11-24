@@ -1,0 +1,16 @@
+[project]
+name = "commute-digest"
+version = "0.1.0"
+description = "通勤晨报，DeepSeek 联网新闻、双语解读与邮件订阅"
+requires-python = ">=3.11,<3.15"
+dependencies = ["streamlit>=1.50,<2"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

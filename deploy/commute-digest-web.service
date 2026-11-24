@@ -1,0 +1,21 @@
+[Unit]
+Description=Commute Digest web application
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=commute-digest
+Group=commute-digest
+WorkingDirectory=/opt/commute-digest
+EnvironmentFile=/etc/commute-digest.env
+StateDirectory=commute-digest
+StateDirectoryMode=0700
+ExecStart=/opt/commute-digest/.venv/bin/python -m streamlit run commute_digest/web.py --server.address=127.0.0.1 --server.port=8501 --server.headless=true --browser.gatherUsageStats=false
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

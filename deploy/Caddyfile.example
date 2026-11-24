@@ -1,0 +1,6 @@
+digest.example.com {
+	basic_auth {
+		reader REPLACE_WITH_BCRYPT_HASH
+	}
+	reverse_proxy 127.0.0.1:8501
+}

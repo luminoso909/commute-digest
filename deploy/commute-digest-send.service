@@ -1,0 +1,16 @@
+[Unit]
+Description=Generate and send the selected Commute Digest edition
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=commute-digest
+Group=commute-digest
+WorkingDirectory=/opt/commute-digest
+EnvironmentFile=/etc/commute-digest.env
+StateDirectory=commute-digest
+StateDirectoryMode=0700
+ExecStart=/opt/commute-digest/.venv/bin/python -m commute_digest deliver
+NoNewPrivileges=true
+PrivateTmp=true
