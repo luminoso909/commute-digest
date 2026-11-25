@@ -4,7 +4,7 @@
 
 | 目录 | 内容 |
 | --- | --- |
-| `commute_digest/` | Python 网页、新闻编辑、投递服务及调度 |
+| `src/commute_digest/` | Python 网页、新闻编辑、投递服务及调度 |
 | `macos/` | macOS 宿主应用和小组件 |
 | `deploy/` | systemd 与 Caddy 部署模板 |
 | `tests/` | Python 离线测试 |
@@ -12,24 +12,49 @@
 
 ## 一、本地运行
 
-安装项目声明的 Python 版本和 `uv`，在项目根目录启动本地网页。SQLite 默认会在项目根目录的 `data/morning.sqlite3` 创建运行数据。
+安装项目声明的 Python 版本和 `uv`，在项目根目录执行以下命令。`uv sync` 会将 Python 包以可编辑模式安装到项目虚拟环境中。SQLite 默认会在项目根目录的 `data/morning.sqlite3` 创建运行数据。
 
 ```bash
 uv sync --locked
-uv run python -m streamlit run commute_digest/web.py
+uv run python -m streamlit run src/commute_digest/web.py
 ```
 
-需要从终端调用在线生成或实际投递时，先加载相应的 API 和邮箱配置。查看命令用法可运行 `uv run python -m commute_digest --help`。以下两条命令使用正式服务配置。
+如果 Windows 下 `uv sync --locked` 已成功，但启动时仍报 `ModuleNotFoundError: No module named 'commute_digest'`，Python 3.11 等版本可能无法正确读取含中文的可编辑安装路径。在项目根目录的 PowerShell 中指定源码目录，再启动网页。
 
-```bash
-uv run python -m commute_digest publish
+```powershell
+$env:PYTHONPATH = (Resolve-Path .\src).Path
+uv run python -m streamlit run src/commute_digest/web.py
 ```
 
+此设置对当前 PowerShell 窗口有效，也适用于下方的 CLI 命令。
+
+要在网页上生成简报，首次配置时将项目根目录的 `.env.example` 复制为 `.env`，并填写 `DEEPSEEK_API_KEY`。可以在 DeepSeek 开放平台创建密钥。只在网页生成简报时，邮箱字段可以留空。用以下命令启动，注册并登录后点击侧栏的「生成并发布」。每次修改 `.env` 后都要重启相关进程。[DeepSeek 开放平台](https://platform.deepseek.com/api_keys)
+
 ```bash
-uv run python -m commute_digest deliver
+uv run --env-file .env python -m streamlit run src/commute_digest/web.py
+```
+
+本地的 `.env` 可能包含密钥和邮箱密码，请妥善保管。要从终端生成简报或发送邮件，也可以用 `--env-file` 加载配置。实际投递前需要填写邮箱字段和 `PUBLIC_BASE_URL`。查看命令用法可运行 `uv run python -m commute_digest --help`。
+
+```bash
+uv run --env-file .env python -m commute_digest publish
+uv run --env-file .env python -m commute_digest deliver
 ```
 
 `publish` 生成并保存内容。`deliver` 使用最近一个已到的 05:00 或 17:00 作为新闻窗口终点，通过 SMTP 发送订阅所选版本，并按该期的北京时间记录投递。网页逐条朗读对应语言的解读，语音格式为 WAV。
+
+### 账号与每日投递
+
+1. 在网页侧栏注册，填写用户名、密码和默认邮箱。登录后可编辑默认邮箱、关注领域、关键词、邮件版式和语言。
+2. 启用每日邮件投递，选择北京时间并保存。可以单独填写投递邮箱，留空时使用默认邮箱。指定时间到达后，系统按账号设置生成并发送最近一期晨报或晚报。新闻窗口仍以北京时间 05:00 和 17:00 为截止点，各覆盖前 12 小时。
+3. 在项目根目录的 `.env` 配置 `DEEPSEEK_API_KEY`、`SMTP_HOST`、`SMTP_PORT`、`SMTP_USER` 和 `SMTP_PASSWORD`。端口默认 `465`，发信地址默认采用 `SMTP_USER`。如有可访问的 HTTPS 网页，可填写 `PUBLIC_BASE_URL`，以便邮件附上该期链接。收件地址由账号设置提供。
+4. 在另一个终端打开项目根目录，运行账号投递进程。它与网页使用同一份 SQLite 数据库，须在希望投递的时间保持运行。
+
+```bash
+uv run --env-file .env python -m commute_digest.subscription_delivery
+```
+
+当天的投递时刻已经过去时，新设置会从下一天生效。每个账号每天最多投递一次。邮件中的账号简报链接需要用对应账号登录。命令行 `deliver` 和下文原有的两期定时任务仍使用服务端 `RECIPIENT_EMAIL`，用于原有单地址投递。
 
 ## 二、Linux 部署
 
@@ -44,7 +69,7 @@ uv run python -m commute_digest deliver
 5. 配置真实演示邮箱并确认订阅后，从项目根目录启用服务和定时任务。定时任务在北京时间每日 05:00 和 17:00 启动，开机后等下一次触发。[systemd 时间格式](https://www.freedesktop.org/software/systemd/man/latest/systemd.time.html) · [systemd 定时任务](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html)
 
 ```bash
-sudo install -d -o commute-digest -g commute-digest -m 0750 /opt/commute-digest/commute_digest/static
+sudo install -d -o commute-digest -g commute-digest -m 0750 /opt/commute-digest/src/commute_digest/static
 sudo install -m 0644 deploy/commute-digest-web.service /etc/systemd/system/
 sudo install -m 0644 deploy/commute-digest-send.service /etc/systemd/system/
 sudo install -m 0644 deploy/commute-digest-send.timer /etc/systemd/system/
@@ -54,7 +79,7 @@ sudo systemctl enable --now commute-digest-send.timer
 systemctl list-timers commute-digest-send.timer
 ```
 
-网页和投递进程都以 `commute-digest` 身份运行。由该用户写入 `commute_digest/static/` 下的标题快照，供网页服务读取。已有部署更新模板并执行 `daemon-reload` 后，重启 `commute-digest-web.service` 以应用新的网页入口。
+网页和投递进程都以 `commute-digest` 身份运行。由该用户写入 `src/commute_digest/static/` 下的标题快照，供网页服务读取。升级已有部署时，先在项目根目录运行 `uv sync --locked` 更新虚拟环境，再安装模板并执行 `daemon-reload`。重启 `commute-digest-web.service` 以应用新的网页入口。
 
 ## 三、最终联调时验证一次真实定时
 
@@ -75,10 +100,10 @@ Persistent=false
 
 AutoDL 容器使用独立的 `screen` 会话运行调度进程。北京时间 05:00 的晨报覆盖前一日 17:00 之后至当日 05:00，17:00 的晚报覆盖当日 05:00 之后至 17:00。调度读取项目私有的 `.env` 后调用 `python -m commute_digest deliver --slot` 并传入相应的期次时间，与网页共用 SQLite。已成功发信的期次由投递记录去重。
 
-升级已有 AutoDL 部署时，将服务器私有脚本 `.autodl/run-web.sh` 中的启动命令改为下面的入口。脚本继续在项目根目录执行并加载现有配置，ngrok 的转发目标仍为 `127.0.0.1:8501`。
+升级已有 AutoDL 部署时，先在项目根目录运行 `uv sync --locked` 更新虚拟环境，再将服务器私有脚本 `.autodl/run-web.sh` 中的启动命令改为下面的入口。脚本继续在项目根目录执行并加载现有配置，ngrok 的转发目标仍为 `127.0.0.1:8501`。
 
 ```bash
-exec .venv/bin/python -m streamlit run commute_digest/web.py \
+exec .venv/bin/python -m streamlit run src/commute_digest/web.py \
   --server.address=127.0.0.1 --server.port=8501 \
   --server.headless=true --browser.gatherUsageStats=false
 ```
@@ -109,4 +134,4 @@ uv run pytest -q
 
 小组件显示最近成功投送的正式一期。日期采用北京时间，标题沿用邮件的版式、语种和顺序。点击整个组件会用默认浏览器打开同一期。断网或新一期尚未投送时，会保留已有缓存及原日期。
 
-标题快照由 Streamlit 在 `/app/static/widget-latest.json` 提供，沿用网页入口的认证。快照已生成但暂无正式投送期次时，接口返回 `null`。如需从 SQLite 的正式投递记录重建 `commute_digest/static/widget-latest.json`，可在项目根目录加载服务环境后运行 `uv run python -m commute_digest widget-feed`。此命令读取投递记录并更新标题快照。
+标题快照由 Streamlit 在 `/app/static/widget-latest.json` 提供，沿用网页入口的认证。快照已生成但暂无正式投送期次时，接口返回 `null`。如需从 SQLite 的正式投递记录重建 `src/commute_digest/static/widget-latest.json`，可在项目根目录加载服务环境后运行 `uv run python -m commute_digest widget-feed`。此命令读取投递记录并更新标题快照。

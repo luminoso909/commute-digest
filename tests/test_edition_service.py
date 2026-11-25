@@ -9,7 +9,7 @@ from streamlit.testing.v1 import AppTest
 
 from commute_digest import edition_service, news_editor
 
-WEB_ENTRY = Path(__file__).resolve().parents[1] / "commute_digest" / "web.py"
+WEB_ENTRY = Path(__file__).resolve().parents[1] / "src" / "commute_digest" / "web.py"
 
 
 def article(category, slug, zh_title, en_title):

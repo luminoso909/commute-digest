@@ -1,7 +1,7 @@
 """Streamlit reader and subscription settings for the two daily editions."""
 
 import re
-from datetime import datetime
+from datetime import datetime, time
 from hashlib import sha256
 from html import escape
 from urllib.parse import urlsplit
@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import streamlit as st
 
-from commute_digest import edition_service, news_editor
+from commute_digest import accounts, edition_service, news_editor
 
 MODE_LABELS = {"cross": "跨领域版", "focus": "我的关注"}
 LANGUAGE_LABELS = {"zh": "中文", "en": "English"}
@@ -76,10 +76,69 @@ def _display_date(value: str, language: str, *, with_time: bool = False) -> str:
     return f"{date} {instant:%H:%M}" if with_time else date
 
 
-def _publish_sidebar(preferences: dict) -> dict | None:
+def _account_sidebar() -> accounts.Account | None:
+    with st.sidebar:
+        st.header("账号")
+        account_id = st.session_state.get("account_id")
+        if account_id is not None:
+            account = accounts.get_account(account_id)
+            if account is not None:
+                st.text(account.username)
+                if st.button("退出登录"):
+                    del st.session_state["account_id"]
+                    st.rerun()
+                return account
+            del st.session_state["account_id"]
+
+        registration = st.radio(
+            "账号操作", ("登录", "注册"), horizontal=True,
+            key="account_action", label_visibility="collapsed",
+        ) == "注册"
+        with st.form("register" if registration else "login", clear_on_submit=True):
+            username = st.text_input("用户名", key="auth_username", max_chars=64)
+            password = st.text_input(
+                "密码", type="password", key="auth_password", max_chars=256,
+                help="至少 8 个字符。" if registration else None,
+            )
+            email = ""
+            if registration:
+                email = st.text_input("默认邮箱", key="registration_email", max_chars=254)
+            submitted = st.form_submit_button("注册并登录" if registration else "登录", type="primary")
+        if submitted:
+            try:
+                account = (
+                    accounts.register(username, password, email)
+                    if registration
+                    else accounts.authenticate(username, password)
+                )
+            except accounts.AccountError as error:
+                st.error(str(error))
+            else:
+                if account is None:
+                    st.error("用户名或密码不正确。")
+                else:
+                    st.session_state["account_id"] = account.id
+                    st.rerun()
+        return None
+
+
+def _publish_sidebar(account: accounts.Account) -> tuple[accounts.Account, edition_service.Issue | None]:
+    preferences = account.preferences
     with st.sidebar:
         st.header("订阅设置")
         with st.form("delivery_preferences"):
+            default_email = st.text_input("默认邮箱", account.default_email, key="default_email", max_chars=254)
+            delivery_override = st.text_input(
+                "投递邮箱（可选）", account.delivery_override, key="delivery_override",
+                placeholder="留空时使用默认邮箱", max_chars=254,
+            )
+            schedule_enabled = st.checkbox(
+                "启用每日邮件投递", account.delivery_time is not None, key="schedule_enabled",
+            )
+            delivery_time = st.time_input(
+                "每日投递时间（北京时间）", account.delivery_time or time(7, 30),
+                step=60, key="delivery_time",
+            )
             topics = st.multiselect(
                 "关注领域",
                 news_editor.CATEGORIES,
@@ -113,29 +172,40 @@ def _publish_sidebar(preferences: dict) -> dict | None:
                 )
             )
             try:
-                edition_service.save_preferences(topics, keywords, delivery_mode, delivery_language)
+                if schedule_enabled and delivery_time is None:
+                    raise accounts.AccountError("请选择每日投递时间。")
+                account = accounts.save_settings(
+                    account.id,
+                    default_email=default_email,
+                    delivery_override=delivery_override,
+                    delivery_time=delivery_time if schedule_enabled else None,
+                    preferences={
+                        "topics": topics,
+                        "keywords": keywords,
+                        "delivery_mode": delivery_mode,
+                        "delivery_language": delivery_language,
+                    },
+                )
             except edition_service.MorningError as error:
                 st.error(str(error))
             else:
                 st.success("订阅设置已保存。")
 
         st.divider()
-        email = edition_service.recipient_email()
-        if email:
-            st.caption(f"收件人 · {email}")
+        if account.delivery_time is not None:
+            st.text(f"每日 {account.delivery_time:%H:%M}（北京时间） · {account.delivery_email}")
         else:
-            st.caption("收件邮箱待配置。")
-        st.caption("每天北京时间 05:00 生成通勤晨报，17:00 生成通勤晚报并投递。")
+            st.caption("每日邮件投递已关闭。")
         if st.button("生成并发布", type="primary"):
             try:
                 with st.spinner("正在采集新闻、整理并发布本期…"):
-                    issue = edition_service.publish()
+                    issue = edition_service.publish(account_id=account.id)
             except edition_service.MorningError as error:
                 st.error(str(error))
             else:
                 st.success(f"第 {issue['id']} 期已发布。")
-                return issue
-    return None
+                return account, issue
+    return account, None
 
 
 def _update_view_query() -> None:
@@ -232,8 +302,11 @@ def main() -> None:
     st.markdown(STYLE, unsafe_allow_html=True)
 
     try:
-        preferences = edition_service.get_preferences()
-        just_published = _publish_sidebar(preferences)
+        account = _account_sidebar()
+        just_published = None
+        if account is not None:
+            account, just_published = _publish_sidebar(account)
+        preferences = account.preferences if account is not None else edition_service.get_preferences()
     except edition_service.MorningError as error:
         st.title("通勤晨报")
         st.error(str(error))
@@ -283,13 +356,15 @@ def main() -> None:
             invalid_issue = True
         else:
             try:
-                issue = edition_service.get_issue(issue_id)
+                issue = edition_service.get_issue(issue_id, account_id=account.id if account else None)
             except edition_service.MorningError as error:
                 load_error = str(error)
 
     title = "通勤晨报" if language == "zh" else "Commute Digest"
     dateline = ""
+    articles = []
     if issue is not None:
+        articles = issue["cross"] if mode == "cross" else issue["focus"]
         if issue.get("edition") == "evening":
             title = "通勤晚报" if language == "zh" else "Commute Evening Digest"
         elif language == "en" and issue.get("window_end"):
@@ -302,7 +377,7 @@ def main() -> None:
             end = _display_date(window_end, language, with_time=True)
             timezone = "北京时间" if language == "zh" else "Beijing time"
             date = f"{start} – {end} {timezone}"
-        count = len(issue[mode])
+        count = len(articles)
         edition = f"第 {issue['id']} 期" if language == "zh" else f"Issue {issue['id']}"
         story_count = (
             f"{count} 条新闻"
@@ -325,11 +400,14 @@ def main() -> None:
     elif issue is None and issue_arg is not None:
         st.warning("未找到这期晨报。")
     elif issue is None:
-        st.info("还没有已发布的新闻简报。可以在侧栏生成并发布第一期。")
-    elif not issue[mode]:
+        if account is None:
+            st.info("还没有已发布的新闻简报。登录后可以生成并发布第一期。")
+        else:
+            st.info("还没有已发布的新闻简报。可以在侧栏生成并发布第一期。")
+    elif not articles:
         st.info("本期这个版式没有新闻。" if language == "zh" else "No stories in this edition.")
     else:
-        for index, article in enumerate(issue[mode]):
+        for index, article in enumerate(articles):
             _article_card(article, language, f"audio_{issue['id']}_{mode}_{language}_{index}")
 
 

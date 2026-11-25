@@ -98,6 +98,10 @@ def _database() -> Iterator[sqlite3.Connection]:
                     created_at TEXT NOT NULL,
                     payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS issue_owners (
+                    issue_id INTEGER PRIMARY KEY REFERENCES issues(id),
+                    account_id INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS deliveries (
                     day TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
@@ -116,27 +120,37 @@ def _database() -> Iterator[sqlite3.Connection]:
         raise MorningError("晨报存储暂时不可用，请检查数据目录。") from exc
 
 
+def _default_preferences() -> Preferences:
+    return {"topics": [], "keywords": [], "delivery_mode": "cross", "delivery_language": "zh"}
+
+
 def get_preferences() -> Preferences:
     with _database() as connection:
         row = connection.execute("SELECT payload FROM preferences WHERE id = 1").fetchone()
     if row is None:
-        return {"topics": [], "keywords": [], "delivery_mode": "cross", "delivery_language": "zh"}
+        return _default_preferences()
     return json.loads(row[0])
 
 
-def save_preferences(
+def _validated_preferences(
     topics: list[str], keywords: list[str], delivery_mode: str, delivery_language: str
-) -> None:
+) -> Preferences:
     if any(topic not in news_editor.CATEGORIES for topic in topics):
         raise MorningError("请在四个现有板块中选择。")
     if delivery_mode not in {"cross", "focus"} or delivery_language not in {"zh", "en"}:
         raise MorningError("请选择有效的邮件版本和语言。")
-    preferences: Preferences = {
+    return {
         "topics": list(dict.fromkeys(topics)),
         "keywords": list(dict.fromkeys(word.strip() for word in keywords if word.strip())),
         "delivery_mode": delivery_mode,
         "delivery_language": delivery_language,
     }
+
+
+def save_preferences(
+    topics: list[str], keywords: list[str], delivery_mode: str, delivery_language: str
+) -> None:
+    preferences = _validated_preferences(topics, keywords, delivery_mode, delivery_language)
     with _database() as connection:
         connection.execute(
             """
@@ -161,17 +175,19 @@ def _issue_from_payload(issue_id: int, created_at: str, payload: dict) -> Issue:
     }
     if slot_text := payload.get("slot"):
         slot = datetime.fromisoformat(slot_text)
-        issue.update(
-            edition="evening" if slot.time() == EVENING_TIME else "morning",
-            slot=slot_text,
-            window_start=(slot - SLOT_INTERVAL).isoformat(),
-            window_end=slot_text,
-        )
+        issue["edition"] = "evening" if slot.time() == EVENING_TIME else "morning"
+        issue["slot"] = slot_text
+        issue["window_start"] = (slot - SLOT_INTERVAL).isoformat()
+        issue["window_end"] = slot_text
     return issue
 
 
 def _publish(
-    preferences: Preferences, slot: datetime, *, exclude_articles: Sequence[dict] = ()
+    preferences: Preferences,
+    slot: datetime,
+    *,
+    exclude_articles: Sequence[dict] = (),
+    account_id: int | None = None,
 ) -> Issue:
     try:
         digest = news_editor.generate_digest(
@@ -192,23 +208,36 @@ def _publish(
             "INSERT INTO issues (created_at, payload) VALUES (?, ?) RETURNING id",
             (created_at, json.dumps(payload, ensure_ascii=False)),
         ).fetchone()
+        if account_id is not None:
+            connection.execute("INSERT INTO issue_owners VALUES (?, ?)", (row[0], account_id))
     return _issue_from_payload(row[0], created_at, payload)
 
 
-def publish() -> Issue:
-    return _publish(get_preferences(), latest_slot(datetime.now(BEIJING)))
+def publish(*, account_id: int | None = None) -> Issue:
+    slot = latest_slot(datetime.now(BEIJING))
+    if account_id is None:
+        return _publish(get_preferences(), slot)
+
+    from . import accounts
+
+    account = accounts.get_account(account_id)
+    if account is None:
+        raise MorningError("请重新登录后再生成简报。")
+    return _publish(account.preferences, slot, account_id=account.id)
 
 
-def get_issue(issue_id: int | None = None) -> Issue | None:
+def get_issue(issue_id: int | None = None, *, account_id: int | None = None) -> Issue | None:
     with _database() as connection:
-        if issue_id is None:
-            row = connection.execute(
-                "SELECT id, created_at, payload FROM issues ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        else:
-            row = connection.execute(
-                "SELECT id, created_at, payload FROM issues WHERE id = ?", (issue_id,)
-            ).fetchone()
+        row = connection.execute(
+            """
+            SELECT issues.id, created_at, payload FROM issues
+            LEFT JOIN issue_owners ON issue_owners.issue_id = issues.id
+            WHERE (issue_owners.account_id IS NULL OR issue_owners.account_id = ?)
+              AND (? IS NULL OR issues.id = ?)
+            ORDER BY issues.id DESC LIMIT 1
+            """,
+            (account_id, issue_id, issue_id),
+        ).fetchone()
     if row is None:
         return None
     return _issue_from_payload(row[0], row[1], json.loads(row[2]))
@@ -286,7 +315,12 @@ def _try_reconcile_widget_feed() -> None:
 def _stories_published_on(day: str) -> list[dict]:
     with _database() as connection:
         payloads = connection.execute(
-            "SELECT payload FROM issues WHERE substr(created_at, 1, 10) = ?", (day,)
+            """
+            SELECT payload FROM issues
+            WHERE substr(created_at, 1, 10) = ?
+              AND NOT EXISTS (SELECT 1 FROM issue_owners WHERE issue_id = issues.id)
+            """,
+            (day,),
         ).fetchall()
     stories = []
     for (payload,) in payloads:
@@ -296,14 +330,18 @@ def _stories_published_on(day: str) -> list[dict]:
     return stories
 
 
-def _mail_settings() -> MailSettings:
+def _mail_settings(recipient_override: str | None = None) -> MailSettings:
     host = os.getenv("SMTP_HOST", "").strip()
     username = os.getenv("SMTP_USER", "").strip()
     password = os.getenv("SMTP_PASSWORD", "")
     sender = os.getenv("SMTP_FROM", "").strip() or username
-    recipient = recipient_email()
+    recipient = recipient_email() if recipient_override is None else recipient_override
     public_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-    if not all((host, username, password, sender, recipient, public_url)):
+    if not all((host, username, password, sender, recipient)):
+        if recipient_override is not None:
+            raise MorningError("请配置 SMTP 发信服务和收件邮箱。")
+        raise MorningError("请配置真实 SMTP、收件邮箱和 PUBLIC_BASE_URL。")
+    if recipient_override is None and not public_url:
         raise MorningError("请配置真实 SMTP、收件邮箱和 PUBLIC_BASE_URL。")
 
     try:
@@ -315,7 +353,7 @@ def _mail_settings() -> MailSettings:
         raise MorningError("SMTP 端口、邮箱地址或站点网址格式有误。") from exc
     if not 1 <= port <= 65535:
         raise MorningError("请填写有效的 SMTP 端口。")
-    if (
+    if public_url and (
         parsed_url.scheme != "https"
         or not parsed_url.hostname
         or parsed_url.query
@@ -336,7 +374,10 @@ def _make_message(
 ) -> EmailMessage:
     mode = preferences["delivery_mode"]
     language = preferences["delivery_language"]
-    issue_link = f"{settings.public_url}/?{urlencode({'issue': issue['id'], 'mode': mode, 'lang': language})}"
+    issue_link = ""
+    if settings.public_url:
+        query = urlencode({"issue": issue["id"], "mode": mode, "lang": language})
+        issue_link = f"{settings.public_url}/?{query}"
     if language == "en":
         title = "Commute Digest"
         edition = "Across Topics" if mode == "cross" else "My Topics"
@@ -369,7 +410,7 @@ def _make_message(
     link_style = "color:#174c86;text-decoration:underline"
     lines = [subject, dateline] if dateline != day else [subject]
     stories = []
-    articles = issue[mode]
+    articles = issue["cross"] if mode == "cross" else issue["focus"]
     for article in articles:
         local = article[language]
         lines.extend(("", local["title"], local["summary"]))
@@ -398,7 +439,13 @@ def _make_message(
     if not articles:
         lines.extend(("", empty))
         stories.append(f'<p style="{body_style};padding:18px 0">{escape(empty)}</p>')
-    lines.extend(("", read_online, issue_link))
+    link_html = ""
+    if issue_link:
+        lines.extend(("", read_online, issue_link))
+        link_html = (
+            '<p style="border-top:1px solid #dbe3ed;padding:16px 0 0;margin:0;font-size:15px">'
+            f'<a href="{escape(issue_link)}" style="{link_style};font-weight:700">{read_online}</a></p>'
+        )
 
     html = f"""<!doctype html>
 <html lang="{language}">
@@ -416,9 +463,7 @@ def _make_message(
         {escape(edition_label)} · {escape(dateline)}
       </p>
       {"".join(stories)}
-      <p style="border-top:1px solid #dbe3ed;padding:16px 0 0;margin:0;font-size:15px">
-        <a href="{escape(issue_link)}" style="{link_style};font-weight:700">{read_online}</a>
-      </p>
+      {link_html}
     </div>
   </body>
 </html>"""
@@ -551,8 +596,8 @@ def main() -> int:
             issue = publish()
             print(f"已发布第 {issue['id']} 期。")
         elif args.command == "widget-feed":
-            issue = reconcile_widget_feed()
-            print(f"已生成小组件第 {issue['issue_id']} 期快照。" if issue else "暂无正式投送期次。")
+            widget_issue = reconcile_widget_feed()
+            print(f"已生成小组件第 {widget_issue['issue_id']} 期快照。" if widget_issue else "暂无正式投送期次。")
         else:
             print(deliver_slot(args.slot, verification=args.verification))
     except (MorningError, OSError) as exc:
