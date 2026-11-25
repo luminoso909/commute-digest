@@ -19,17 +19,42 @@ uv sync --locked
 uv run python -m streamlit run src/commute_digest/web.py
 ```
 
-需要从终端调用在线生成或实际投递时，先加载相应的 API 和邮箱配置。查看命令用法可运行 `uv run python -m commute_digest --help`。以下两条命令使用正式服务配置。
+如果 Windows 下 `uv sync --locked` 已成功，但启动时仍报 `ModuleNotFoundError: No module named 'commute_digest'`，Python 3.11 等版本可能无法正确读取含中文的可编辑安装路径。在项目根目录的 PowerShell 中指定源码目录，再启动网页。
 
-```bash
-uv run python -m commute_digest publish
+```powershell
+$env:PYTHONPATH = (Resolve-Path .\src).Path
+uv run python -m streamlit run src/commute_digest/web.py
 ```
 
+此设置对当前 PowerShell 窗口有效，也适用于下方的 CLI 命令。
+
+要在网页上生成简报，首次配置时将项目根目录的 `.env.example` 复制为 `.env`，并填写 `DEEPSEEK_API_KEY`。可以在 DeepSeek 开放平台创建密钥。只在网页生成简报时，邮箱字段可以留空。用以下命令启动，注册并登录后点击侧栏的「生成并发布」。每次修改 `.env` 后都要重启相关进程。[DeepSeek 开放平台](https://platform.deepseek.com/api_keys)
+
 ```bash
-uv run python -m commute_digest deliver
+uv run --env-file .env python -m streamlit run src/commute_digest/web.py
+```
+
+本地的 `.env` 可能包含密钥和邮箱密码，请妥善保管。要从终端生成简报或发送邮件，也可以用 `--env-file` 加载配置。实际投递前需要填写邮箱字段和 `PUBLIC_BASE_URL`。查看命令用法可运行 `uv run python -m commute_digest --help`。
+
+```bash
+uv run --env-file .env python -m commute_digest publish
+uv run --env-file .env python -m commute_digest deliver
 ```
 
 `publish` 生成并保存内容。`deliver` 使用最近一个已到的 05:00 或 17:00 作为新闻窗口终点，通过 SMTP 发送订阅所选版本，并按该期的北京时间记录投递。网页逐条朗读对应语言的解读，语音格式为 WAV。
+
+### 账号与每日投递
+
+1. 在网页侧栏注册，填写用户名、密码和默认邮箱。登录后可编辑默认邮箱、关注领域、关键词、邮件版式和语言。
+2. 启用每日邮件投递，选择北京时间并保存。可以单独填写投递邮箱，留空时使用默认邮箱。指定时间到达后，系统按账号设置生成并发送最近一期晨报或晚报。新闻窗口仍以北京时间 05:00 和 17:00 为截止点，各覆盖前 12 小时。
+3. 在项目根目录的 `.env` 配置 `DEEPSEEK_API_KEY`、`SMTP_HOST`、`SMTP_PORT`、`SMTP_USER` 和 `SMTP_PASSWORD`。端口默认 `465`，发信地址默认采用 `SMTP_USER`。如有可访问的 HTTPS 网页，可填写 `PUBLIC_BASE_URL`，以便邮件附上该期链接。收件地址由账号设置提供。
+4. 在另一个终端打开项目根目录，运行账号投递进程。它与网页使用同一份 SQLite 数据库，须在希望投递的时间保持运行。
+
+```bash
+uv run --env-file .env python -m commute_digest.subscription_delivery
+```
+
+当天的投递时刻已经过去时，新设置会从下一天生效。每个账号每天最多投递一次。邮件中的账号简报链接需要用对应账号登录。命令行 `deliver` 和下文原有的两期定时任务仍使用服务端 `RECIPIENT_EMAIL`，用于原有单地址投递。
 
 ## 二、Linux 部署
 
