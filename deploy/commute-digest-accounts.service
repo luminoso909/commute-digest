@@ -1,0 +1,21 @@
+[Unit]
+Description=Send Commute Digest account subscriptions
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=commute-digest
+Group=commute-digest
+WorkingDirectory=/opt/commute-digest
+EnvironmentFile=/etc/commute-digest.env
+StateDirectory=commute-digest
+StateDirectoryMode=0700
+ExecStart=/opt/commute-digest/.venv/bin/python -u -m commute_digest.subscription_delivery
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

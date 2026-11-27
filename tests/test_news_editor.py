@@ -1,6 +1,7 @@
 import io
 import json
 import wave
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.error import HTTPError
 
@@ -13,8 +14,8 @@ WINDOW_START = NOW - timedelta(hours=12)
 FIELDS = {
     "title": "A title",
     "summary": "A summary",
-    "background": "Some background",
-    "why_it_matters": "The impact",
+    "details": "Reported facts and context",
+    "analysis": "The mechanism and its impact",
 }
 
 
@@ -76,11 +77,11 @@ def install_responses(monkeypatch, research, draft, *, verify_publishers=False):
     monkeypatch.setattr(news_editor, "_post", post)
     if not verify_publishers:
         research_sources = news_editor._research_sources
-        monkeypatch.setattr(
-            news_editor,
-            "_research_sources",
-            lambda output, start, end, **kwargs: research_sources(output, start, end),
-        )
+        def local_sources(output, start, end, **kwargs):
+            sources, notes = research_sources(output, start, end)
+            return {key: replace(source, publisher_excerpt="The publisher reported confirmed facts.")
+                    for key, source in sources.items()}, notes
+        monkeypatch.setattr(news_editor, "_research_sources", local_sources)
     return requests
 
 
@@ -99,9 +100,11 @@ def test_generation_uses_publisher_timestamps_instead_of_search_dates(monkeypatc
         "exact-midnight": midnight,
         "on-cutoff": NOW,
     }
-    monkeypatch.setattr(
-        news_editor.publisher_time, "published_at", lambda url: verified.get(url.rsplit("/", 1)[-1])
-    )
+    def read_page(url):
+        timestamp = verified.get(url.rsplit("/", 1)[-1])
+        return news_editor.publisher_time.ArticlePage(timestamp, "Publisher's direct account.") if timestamp else None
+
+    monkeypatch.setattr(news_editor.publisher_time, "read_article", read_page)
     requests = install_responses(
         monkeypatch,
         result,
@@ -117,6 +120,7 @@ def test_generation_uses_publisher_timestamps_instead_of_search_dates(monkeypatc
     }
     draft_input = json.loads(requests[1][1]["messages"][1]["content"])
     assert len(draft_input["sources"]) == 3
+    assert all(row["publisher_excerpt"] == "Publisher's direct account." for row in draft_input["sources"].values())
 
 
 def test_digest_only_uses_recent_api_sources_and_deduplicates(monkeypatch):
@@ -386,7 +390,7 @@ def test_sparse_focus_and_unverified_attribution(monkeypatch):
 
 
 def test_keyword_only_focus_requires_evidence_in_the_story(monkeypatch):
-    rail = entry("S1", "rail", en={**FIELDS, "title": "New rail line", "why_it_matters": "AI"})
+    rail = entry("S1", "rail", en={**FIELDS, "title": "New rail line", "analysis": "AI"})
     ai = entry("S2", "ai")
     chip = entry("S3", "chip", zh={**FIELDS, "summary": "研究团队公布芯片测试结果。"})
     install_responses(
@@ -518,6 +522,103 @@ def test_missing_key_and_http_errors_are_explicit(monkeypatch):
         news_editor.synthesize("Good morning")
 
 
+def test_new_copy_stores_three_sections_and_focus_reuses_cross_entries(monkeypatch):
+    primary = {**FIELDS, "summary": ["动作。", "规模。", "多余评价。"]}
+    draft = {
+        "cross": [entry("S1", "first", zh=primary), entry("S2", "second"), entry("S3", "third")],
+        "focus": ["S1", "S2", "S3"],
+    }
+    install_responses(monkeypatch, research_response(*(news_source(str(i)) for i in range(3))), draft)
+    digest = news_editor.generate_digest([news_editor.CATEGORIES[0]], [], now=NOW)
+    assert digest["cross"] == digest["focus"]
+    copy = digest["cross"][0]["zh"]
+    assert set(copy) == {"title", "summary", "details", "analysis"}
+    assert copy["summary"] == "动作。规模。"
+    assert news_editor.reading_sections(copy) == (FIELDS["details"], FIELDS["analysis"])
+    historical = {"summary": "headline facts", "background": "old body", "why_it_matters": "old impact"}
+    assert news_editor.reading_sections(historical) == ("old body", "old impact")
+    assert news_editor._summary("U.S. sales rose 2.5%. Costs fell. Further comment.") == (
+        "U.S. sales rose 2.5%. Costs fell."
+    )
+
+
+def test_generation_requires_original_body_or_attributed_notes_from_opened_page(monkeypatch):
+    slugs = ("headline-only", "read", "unopened", "original", "another", "lede-only")
+    research = research_response(*(news_source(slug) for slug in slugs))
+    url = "https://news.example/read"
+    sentence = "班次从八班增至十班，高峰期的间隔缩短至二十分钟。"
+    note = sentence + "\nOther story https://news.example/unopened"
+    research["output"][1]["content"] = [{
+        "type": "output_text", "text": note,
+        "annotations": [{"type": "url_citation", "url": url, "start_index": 0, "end_index": len(sentence)}],
+    }]
+    research["output"].append({
+        "type": "web_search_call", "status": "completed", "action": {"type": "open_page"},
+        "page": {"url": url},
+    })
+    originals = {"original", "another"}
+    def local_page(url):
+        slug = url.rsplit("/", 1)[-1]
+        body = "Original publisher reporting." if slug in originals else ""
+        if slug == "lede-only":
+            body = news_source(slug)["snippet"]
+        return news_editor.publisher_time.ArticlePage(NOW, body)
+    monkeypatch.setattr(news_editor.publisher_time, "read_article", local_page)
+    draft = {"cross": [entry("S1", "read"), entry("S4", "original"), entry("S5", "another")]}
+    requests = install_responses(monkeypatch, research, draft, verify_publishers=True)
+    report = news_editor.generate_digest([], [], now=NOW)
+    assert [row["event_key"] for row in report["cross"]] == ["read", "original", "another"]
+    supplied = json.loads(requests[1][1]["messages"][1]["content"])
+    assert supplied["research_notes"] == {"S1": sentence}
+    assert {r["url"].rsplit("/", 1)[-1] for r in supplied["sources"].values()} == originals | {"read"}
+
+
+def test_truncated_draft_retries_same_evidence_with_larger_budget(monkeypatch):
+    requests = []
+    def post(path, payload, **kwargs):
+        requests.append(payload)
+        finish, content = ("length", "{") if len(requests) == 1 else ("stop", '{"cross":[]}')
+        return json.dumps({"choices": [{"finish_reason": finish, "message": {"content": content}}]}).encode()
+    monkeypatch.setattr(news_editor, "_post", post)
+    assert news_editor._draft({}, {}, [], [], [], "cross") == {"cross": []}
+    assert [payload["max_tokens"] for payload in requests] == [16384, 32768]
+    assert requests[0]["messages"] == requests[1]["messages"]
+    assert news_editor._language_fields({**FIELDS, "details": FIELDS["summary"]}) is None
+
+
+def test_selected_provider_routes_chat_and_keeps_keys_separate(monkeypatch):
+    requests = []
+
+    def reply(request, timeout):
+        body = json.loads(request.data)
+        requests.append((request.full_url, request.get_header("Authorization"), body))
+        if "messages" in body:
+            return io.BytesIO(b'{"choices":[{"finish_reason":"stop","message":{"content":"{}"}}]}')
+        return io.BytesIO(b"research-or-speech")
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "server-deepseek")
+    monkeypatch.setattr(news_editor, "urlopen", reply)
+    with news_editor.use_model("qwen-plus", "personal-qwen", deepseek_key="personal-research"):
+        news_editor._draft({}, "", [], [], [], "cross")
+        news_editor.check_model_connection("deepseek-v4-pro", "personal-deepseek")
+        news_editor._post("/v1/tools/tts", {"text": "Hello"}, operation="朗读", timeout=5)
+        news_editor._post("/responses", {"model": news_editor.DEFAULT_MODEL}, operation="搜索", timeout=5)
+        news_editor._draft({}, "", [], [], [], "cross")
+    news_editor._draft({}, "", [], [], [], "cross")
+
+    assert requests[0][0:2] == (
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "Bearer personal-qwen"
+    )
+    assert requests[0][2]["model"] == "qwen-plus" and not requests[0][2]["enable_thinking"]
+    assert requests[1][0:2] == ("https://api.deepseek.com/chat/completions", "Bearer personal-deepseek")
+    assert requests[1][2]["model"] == "deepseek-v4-pro" and requests[1][2]["max_tokens"] == 16
+    assert requests[2][0:2] == ("https://api.deepseek.com/v1/tools/tts", "Bearer personal-research")
+    assert requests[3][0:2] == ("https://api.deepseek.com/responses", "Bearer personal-research")
+    assert requests[4][1] == "Bearer personal-qwen"
+    assert requests[5][1] == "Bearer server-deepseek"
+    assert not news_editor.same_model_provider("qwen-plus", "deepseek-flash")
+
+
 @pytest.fixture
 def wav_audio():
     buffer = io.BytesIO()
@@ -543,6 +644,25 @@ def test_tts_returns_audio_and_rejects_truncated_content(monkeypatch, wav_audio)
 
     with pytest.raises(ValueError, match="不能为空"):
         news_editor.synthesize(" ")
+
+
+def test_tts_splits_overlong_article_and_joins_only_complete_audio(monkeypatch, wav_audio):
+    requests = []
+    def post(path, payload, **kwargs):
+        requests.append(payload["text"])
+        return wav_audio
+    monkeypatch.setattr(news_editor, "_post", post)
+    first, second = "甲" * 4000 + "。", "乙" * 1500 + "。"
+    output = news_editor.synthesize(first + second)
+    assert requests == [first, second]
+    with wave.open(io.BytesIO(output)) as audio:
+        assert audio.getnframes() == 256
+        assert audio.readframes(256) == bytes(512)
+    assert news_editor._speech_chunks("a" * 20001) == ["a" * 10000, "a" * 10000, "a"]
+    pieces = iter([wav_audio, wav_audio[:-1]])
+    monkeypatch.setattr(news_editor, "_post", lambda *a, **k: next(pieces))
+    with pytest.raises(news_editor.EditorError, match="音频不完整"):
+        news_editor.synthesize(first + second)
 
 
 def test_tts_rejects_riff_without_audio_chunks(monkeypatch):
@@ -587,3 +707,16 @@ def test_tts_accepts_complete_frames_with_streaming_sizes(monkeypatch, wav_audio
     response = b"RIFF" + size + wav_audio[8:40] + size + wav_audio[44:]
     monkeypatch.setattr(news_editor, "_post", lambda *args, **kwargs: response)
     assert news_editor.synthesize("Good morning") == response
+
+def test_empty_personal_keys_cannot_use_shared_credentials(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "shared-key")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "shared-qwen-key")
+    monkeypatch.setattr(news_editor, "urlopen", lambda *a, **k: pytest.fail("unexpected network request"))
+    for model in news_editor.MODEL_OPTIONS:
+        with pytest.raises(news_editor.EditorError, match="个人 API 密钥"):
+            news_editor.check_model_connection(model, "")
+    with news_editor.use_model("qwen-plus","only-qwen"):
+        with pytest.raises(news_editor.EditorError, match="个人 DeepSeek"):
+            news_editor.synthesize("test")
+        with pytest.raises(news_editor.EditorError, match="个人 DeepSeek"):
+            news_editor._post("/responses", {}, operation="搜索", timeout=5)

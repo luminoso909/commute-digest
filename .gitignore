@@ -12,6 +12,7 @@ __pycache__/
 xcuserdata/
 DerivedData/
 data/
+*.keys/
 /static/widget-latest.json
 /static/.widget-latest.*
 /src/commute_digest/static/widget-latest.json

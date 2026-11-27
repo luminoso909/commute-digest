@@ -159,7 +159,7 @@ enum DigestFeedError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidFeed: return "服务器返回的标题数据无法读取。"
-        case .invalidCredentials: return "阅读账号或密码有误。"
+        case .invalidCredentials: return "日报网址需要授权，请检查服务器的公开标题入口。"
         case .unavailable: return "暂时无法连接日报网页。"
         }
     }
@@ -178,13 +178,11 @@ private final class StayOnEndpoint: NSObject, URLSessionTaskDelegate {
 }
 
 enum DigestFeedClient {
-    static func fetch(using credentials: ReadingCredentials) async throws -> DigestFeed? {
+    static func fetch(using credentials: SiteConnection) async throws -> DigestFeed? {
         var request = URLRequest(
             url: credentials.origin.appending(path: "app/static/widget-latest.json"),
             cachePolicy: .reloadIgnoringLocalCacheData
         )
-        let pair = Data("\(credentials.username):\(credentials.password)".utf8)
-        request.setValue("Basic " + pair.base64EncodedString(), forHTTPHeaderField: "Authorization")
         request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let configuration = URLSessionConfiguration.ephemeral

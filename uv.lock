@@ -198,6 +198,8 @@ name = "commute-digest"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "pillow" },
+    { name = "starlette" },
     { name = "streamlit" },
 ]
 
@@ -207,7 +209,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "streamlit", specifier = ">=1.50,<2" }]
+requires-dist = [
+    { name = "pillow", specifier = ">=9.2" },
+    { name = "starlette", specifier = ">=1.0,<2" },
+    { name = "streamlit", specifier = ">=1.67,<2" },
+]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8,<10" }]

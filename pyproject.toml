@@ -1,9 +1,9 @@
 [project]
 name = "commute-digest"
 version = "0.1.0"
-description = "通勤晨报，DeepSeek 联网新闻、双语解读与邮件订阅"
+description = "通勤日报，早晚新闻、双语解读与邮件订阅"
 requires-python = ">=3.11,<3.15"
-dependencies = ["streamlit>=1.50,<2"]
+dependencies = ["streamlit>=1.67,<2", "starlette>=1.0,<2", "pillow>=9.2"]
 
 [dependency-groups]
 dev = ["pytest>=8,<10"]

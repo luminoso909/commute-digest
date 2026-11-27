@@ -1,34 +1,22 @@
 import Foundation
 import Security
 
-struct ReadingCredentials: Codable, Equatable {
+struct SiteConnection: Codable, Equatable {
     let origin: URL
-    let username: String
-    let password: String
-
     enum CodingKeys: String, CodingKey {
         case origin = "baseURL"
-        case username, password
     }
 
-    init(baseURL: String, username: String, password: String) throws {
-        let baseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let username = username.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let origin = Self.approvedOrigin(baseURL), !username.isEmpty,
-              !username.contains(":"), !password.isEmpty
+    init(baseURL: String) throws {
+        guard let origin = Self.approvedOrigin(baseURL.trimmingCharacters(in: .whitespacesAndNewlines))
         else { throw CredentialError.invalidInput }
         self.origin = origin
-        self.username = username
-        self.password = password
     }
 
     init(from decoder: Decoder) throws {
+        // Earlier versions stored extra fields alongside the website URL.
         let data = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(
-            baseURL: data.decode(String.self, forKey: .origin),
-            username: data.decode(String.self, forKey: .username),
-            password: data.decode(String.self, forKey: .password)
-        )
+        try self.init(baseURL: data.decode(String.self, forKey: .origin))
     }
 
     static func approvedOrigin(_ baseURL: String) -> URL? {
@@ -48,7 +36,7 @@ enum CredentialError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidInput: return "请填写 HTTPS 日报网址、账号和阅读密码。"
+        case .invalidInput: return "请填写日报的 HTTPS 网址。"
         case .keychain, .keychainMismatch: return "无法访问 macOS 钥匙串。请解锁登录钥匙串后重试。"
         case .missingTargets: return "找不到安装包内的小组件，请重新安装宿主 App。"
         }
@@ -63,7 +51,7 @@ enum DigestKeychain {
         kSecUseDataProtectionKeychain as String: false,
     ]
 
-    static func read(promptIfNeeded: Bool = false) throws -> ReadingCredentials? {
+    static func read(promptIfNeeded: Bool = false) throws -> SiteConnection? {
         var lookup = query
         if !promptIfNeeded {
             lookup[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
@@ -76,10 +64,10 @@ enum DigestKeychain {
         guard status == errSecSuccess, let data = value as? Data else {
             throw CredentialError.keychain(status)
         }
-        return try JSONDecoder().decode(ReadingCredentials.self, from: data)
+        return try JSONDecoder().decode(SiteConnection.self, from: data)
     }
 
-    static func save(_ credentials: ReadingCredentials) throws {
+    static func save(_ credentials: SiteConnection) throws {
         let access = try packagedAppAccess()
         let attributes: [String: Any] = [
             kSecValueData as String: try JSONEncoder().encode(credentials),
@@ -88,7 +76,7 @@ enum DigestKeychain {
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
             var item = query.merging(attributes) { _, new in new }
-            item[kSecAttrLabel as String] = "通勤晨报阅读密码"
+            item[kSecAttrLabel as String] = "通勤日报网址"
             try check(SecItemAdd(item as CFDictionary, nil))
         } else {
             try check(status)
@@ -109,7 +97,7 @@ enum DigestKeychain {
             return result
         }
         var access: SecAccess?
-        try check(SecAccessCreate("通勤晨报阅读密码" as CFString, trusted as CFArray, &access))
+        try check(SecAccessCreate("通勤日报网址" as CFString, trusted as CFArray, &access))
         guard let access else { throw CredentialError.missingTargets }
         return access
     }

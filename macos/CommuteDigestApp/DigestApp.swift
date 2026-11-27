@@ -8,10 +8,10 @@ private enum SettingsStore {
 
     static var origin: URL? {
         UserDefaults.standard.string(forKey: originKey)
-            .flatMap(ReadingCredentials.approvedOrigin)
+            .flatMap(SiteConnection.approvedOrigin)
     }
 
-    static func save(_ credentials: ReadingCredentials) throws {
+    static func save(_ credentials: SiteConnection) throws {
         try DigestKeychain.save(credentials)
         guard try DigestKeychain.read() == credentials else { throw CredentialError.keychainMismatch }
         UserDefaults.standard.set(credentials.origin.absoluteString, forKey: originKey)
@@ -40,7 +40,7 @@ private enum DigestApp {
             guard let data = try FileHandle.standardInput.readToEnd(), data.count <= 8_192 else {
                 throw CredentialError.invalidInput
             }
-            let credentials = try JSONDecoder().decode(ReadingCredentials.self, from: data)
+            let credentials = try JSONDecoder().decode(SiteConnection.self, from: data)
             try SettingsStore.save(credentials)
             print("credentials_configured=1")
         } catch CredentialError.keychain(let status) {
@@ -87,12 +87,12 @@ private final class DigestAppDelegate: NSObject, NSApplicationDelegate {
             settingsWindow.makeKeyAndOrderFront(nil)
         } else {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 420, height: 280),
+                contentRect: NSRect(x: 0, y: 0, width: 420, height: 180),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false
             )
-            window.title = "通勤晨报"
+            window.title = "通勤日报"
             window.contentViewController = NSHostingController(rootView: ConnectionSettings())
             window.isReleasedWhenClosed = false
             window.center()
@@ -105,23 +105,8 @@ private final class DigestAppDelegate: NSObject, NSApplicationDelegate {
 
 private struct ConnectionSettings: View {
     @State private var address = SettingsStore.origin?.absoluteString ?? ""
-    @State private var username = ""
-    @State private var password = ""
-    @State private var savedOrigin: URL?
-    @State private var savedUsername: String?
     @State private var status = ""
     @State private var busy = false
-
-    private var canUseSavedPassword: Bool {
-        guard let savedOrigin, let savedUsername else { return false }
-        return ReadingCredentials.approvedOrigin(address.trimmingCharacters(in: .whitespacesAndNewlines))
-            == savedOrigin && username.trimmingCharacters(in: .whitespacesAndNewlines) == savedUsername
-    }
-
-    private var actionTitle: String {
-        if busy { return "正在连接…" }
-        return password.isEmpty && canUseSavedPassword ? "验证连接" : "保存"
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -129,20 +114,16 @@ private struct ConnectionSettings: View {
                 .font(.title2.weight(.semibold))
             TextField("日报网址", text: $address, prompt: Text("https://…"))
                 .disabled(busy)
-            TextField("阅读账号", text: $username)
-                .disabled(busy)
-            SecureField("阅读密码", text: $password)
-                .disabled(busy)
             HStack {
                 Text(status)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button(actionTitle) {
+                Button(busy ? "正在连接…" : "验证并保存") {
                     Task { await connect() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(busy || address.isEmpty || username.isEmpty || (password.isEmpty && !canUseSavedPassword))
+                .disabled(busy || address.isEmpty)
             }
         }
         .padding(24)
@@ -150,9 +131,6 @@ private struct ConnectionSettings: View {
         .task {
             if let existing = try? DigestKeychain.read() {
                 address = existing.origin.absoluteString
-                username = existing.username
-                savedOrigin = existing.origin
-                savedUsername = existing.username
                 await connect()
             }
         }
@@ -163,26 +141,10 @@ private struct ConnectionSettings: View {
         guard !busy else { return }
         busy = true
         defer { busy = false }
-        let usingSavedPassword = password.isEmpty
         do {
-            let credentials: ReadingCredentials
-            if usingSavedPassword {
-                guard canUseSavedPassword, let existing = try DigestKeychain.read(),
-                      existing.origin == savedOrigin, existing.username == savedUsername
-                else { throw CredentialError.invalidInput }
-                credentials = existing
-            } else {
-                credentials = try ReadingCredentials(baseURL: address, username: username, password: password)
-            }
-            let feed = try await DigestFeedClient.fetch(using: credentials)
-            if usingSavedPassword {
-                WidgetCenter.shared.reloadTimelines(ofKind: SettingsStore.widgetKind)
-            } else {
-                try SettingsStore.save(credentials)
-                savedOrigin = credentials.origin
-                savedUsername = credentials.username
-            }
-            password = ""
+            let connection = try SiteConnection(baseURL: address)
+            let feed = try await DigestFeedClient.fetch(using: connection)
+            try SettingsStore.save(connection)
             status = feed.map { "已连接，已读取第 \($0.issueID) 期。" } ?? "已连接，等待首次投送。"
         } catch let error as DigestFeedError {
             status = error.localizedDescription

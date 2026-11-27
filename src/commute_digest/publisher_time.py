@@ -1,4 +1,4 @@
-"""Read the publication timestamp from an article's public HTTPS page."""
+"""Read first-publication metadata and a bounded excerpt from a publisher page."""
 
 import http.client
 import ipaddress
@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import ssl
+from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 from urllib.parse import quote, urlsplit
@@ -64,6 +65,18 @@ _JIN10_DATELINE = re.compile(
 _JIN10_DETAIL = re.compile(r"/detail/(\d{14})\d{6}/?")
 _MAX_HTML = 512 * 1024
 _REQUEST_TIMEOUT = 5
+_MAX_EXCERPT = 1200
+_BODY_MARKERS = {"articlebody", "article-content", "article_content", "articlecontent", "post-content",
+                 "article-con", "content-detail", "post_content", "detail-content"}
+_SKIP_MARKERS = {"advertisement", "newsletter", "related-articles", "related-posts", "comments",
+                 "cookie-banner", "paywall", "sidebar"}
+_SKIP_TAGS = {"aside", "footer", "header", "nav", "script", "style", "form", "button", "figure"}
+
+
+@dataclass(frozen=True)
+class ArticlePage:
+    published_at: datetime
+    excerpt: str
 
 
 def _in_domain(host: str, domain: str) -> bool:
@@ -75,6 +88,10 @@ class _PublicationMetadata(HTMLParser):
         super().__init__()
         self.values: list[str] = []
         self._json_script = False
+        self._regions: list[tuple[str, str]] = []
+        self._paragraph: list[str] | None = None
+        self._article_text = ""
+        self._structured_text = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         fields = {key: value or "" for key, value in attrs}
@@ -85,13 +102,35 @@ class _PublicationMetadata(HTMLParser):
             self.values.append(fields.get("datetime", ""))
         if tag == "script":
             self._json_script = fields.get("type", "").casefold() == "application/ld+json"
+        if tag in _SKIP_TAGS:
+            self._regions.append((tag, "skip"))
+        elif tag in {"div", "article", "main", "section"}:
+            markers = {token.casefold() for key in ("class", "id", "itemprop")
+                       for token in fields.get(key, "").split()}
+            region = self._regions[-1][1] if self._regions else "other"
+            if markers & _SKIP_MARKERS:
+                region = "skip"
+            elif region != "skip" and (tag in {"article", "main"} or markers & _BODY_MARKERS):
+                region = "body"
+            self._regions.append((tag, region))
+        if tag == "p" and len(self._article_text) < _MAX_EXCERPT and self._reading_body():
+            self._paragraph = []
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "script":
             self._json_script = False
+        if self._regions and self._regions[-1][0] == tag:
+            self._regions.pop()
+        if tag == "p" and self._paragraph is not None:
+            paragraph = "".join(self._paragraph).strip()
+            if paragraph:
+                self._article_text = (self._article_text + "\n" + paragraph)[:_MAX_EXCERPT]
+            self._paragraph = None
 
     def handle_data(self, data: str) -> None:
         if not self._json_script:
+            if self._paragraph is not None and self._reading_body():
+                self._paragraph.append(data)
             return
         try:
             structured = json.loads(data)
@@ -109,21 +148,25 @@ class _PublicationMetadata(HTMLParser):
                 value = node.get("datePublished") or node.get("pubDate")
                 if isinstance(value, str):
                     self.values.append(value)
+                body = node.get("articleBody")
+                if isinstance(body, str) and not self._structured_text:
+                    self._structured_text = body.strip()
+
+    @property
+    def excerpt(self) -> str:
+        text = self._structured_text or self._article_text
+        return " ".join(text.split())[:_MAX_EXCERPT]
+
+    def _reading_body(self) -> bool:
+        return bool(self._regions) and self._regions[-1][1] == "body"
 
 
-def publication_time_from_html(html: str, url: str) -> datetime | None:
-    """Extract an explicit first-publication timestamp from an article page."""
+def _publication_time(html: str, url: str, values: list[str]) -> datetime | None:
     endpoint = urlsplit(url)
     host = endpoint.hostname or ""
     local_time = any(_in_domain(host, domain) for domain in _CHINESE_PUBLISHERS)
-    parser = _PublicationMetadata()
-    try:
-        parser.feed(html)
-    except (ValueError, AssertionError):
-        return None
-
     times = set()
-    for value in parser.values:
+    for value in values:
         published = _parse_timestamp(value, local_time)
         if published is not None:
             times.add(published)
@@ -140,6 +183,21 @@ def publication_time_from_html(html: str, url: str) -> datetime | None:
     else:
         match = None
     return _parse_timestamp(match[1], local_time) if match else None
+
+
+def article_page_from_html(html: str, url: str) -> ArticlePage | None:
+    parser = _PublicationMetadata()
+    try:
+        parser.feed(html)
+    except (ValueError, AssertionError):
+        return None
+    published = _publication_time(html, url, parser.values)
+    return ArticlePage(published, parser.excerpt) if published else None
+
+
+def publication_time_from_html(html: str, url: str) -> datetime | None:
+    page = article_page_from_html(html, url)
+    return page.published_at if page else None
 
 
 def _jin10_timestamp(html: str, path: str) -> datetime | None:
@@ -193,8 +251,8 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             raise
 
 
-def published_at(url: str) -> datetime | None:
-    """Verify publication time from a public page without following redirects."""
+def read_article(url: str) -> ArticlePage | None:
+    """Read the original page once, without following redirects."""
     if any(ord(character) <= 32 or ord(character) == 127 for character in url):
         return None
     try:
@@ -234,6 +292,11 @@ def published_at(url: str) -> datetime | None:
                 charset = response.headers.get_content_charset() or "utf-8"
         finally:
             connection.close()
-        return publication_time_from_html(page.decode(charset, errors="replace"), url)
+        return article_page_from_html(page.decode(charset, errors="replace"), url)
     except (OSError, ValueError, LookupError, http.client.HTTPException):
         return None
+
+
+def published_at(url: str) -> datetime | None:
+    page = read_article(url)
+    return page.published_at if page else None

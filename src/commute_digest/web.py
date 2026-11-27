@@ -1,415 +1,234 @@
-"""Streamlit reader and subscription settings for the two daily editions."""
+"""Chronological news reader with issue and article permalinks."""
 
-import re
-from datetime import datetime, time
+from datetime import datetime
 from hashlib import sha256
 from html import escape
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 import streamlit as st
 
-from commute_digest import accounts, edition_service, news_editor
+from commute_digest import accounts, edition_service, news_editor, web_settings
+from commute_digest.schedule import BEIJING
+from commute_digest.web_style import apply_style
 
-MODE_LABELS = {"cross": "跨领域版", "focus": "我的关注"}
-LANGUAGE_LABELS = {"zh": "中文", "en": "English"}
-ENGLISH_CATEGORIES = {
-    "科技与 AI": "Technology & AI",
-    "商业与产业": "Business & Industry",
-    "科学与环境": "Science & Environment",
-    "社会与公共生活": "Society & Public Life",
-}
-BEIJING = ZoneInfo("Asia/Shanghai")
+PAGE_SIZE = 8
 MAX_AUDIO_FILES = 10
-
-STYLE = """
-<style>
-.stApp { background: #f7f7f0; }
-[data-testid="stHeader"] { background: #f7f7f0; }
-[data-testid="stSidebar"] { background: #edf2eb; }
-.stMainBlockContainer { max-width: 54rem; padding-top: 2.25rem; }
-.digest-masthead { border-bottom: solid 2px #213c3b; padding-bottom: 1rem; }
-.digest-masthead h1 {
-    color: #193532; font-family: Georgia, "Noto Serif CJK SC", "Songti SC", serif;
-    font-size: clamp(2.6rem, 8vw, 4.65rem); font-weight: 700; letter-spacing: -0.045em;
-    line-height: 1.08; margin: 0; padding: 0;
+ENGLISH_CATEGORIES = {
+    "科技与 AI": "Technology & AI", "商业与产业": "Business & Industry",
+    "科学与环境": "Science & Environment", "社会与公共生活": "Society & Public Life",
+    "财经与市场": "Finance & Markets", "国际事务": "World Affairs",
+    "教育与研究": "Education & Research", "健康与医疗": "Health & Medicine",
+    "能源与交通": "Energy & Transport", "文化与艺术": "Culture & Arts", "体育": "Sports",
 }
-.digest-dateline {
-    color: #46645b; font-size: 0.86rem; letter-spacing: 0.035em;
-    margin-top: 0.7rem;
-}
-.digest-meta {
-    color: #49675e; font-size: 0.85rem; line-height: 1.5;
-    overflow-wrap: anywhere; margin: 0 0 0.45rem;
-}
-.digest-title {
-    color: #193532; font-family: Georgia, "Noto Serif CJK SC", "Songti SC", serif;
-    font-size: clamp(1.35rem, 4.8vw, 1.8rem); font-weight: 700;
-    line-height: 1.3; margin: 0; padding: 0; overflow-wrap: anywhere;
-}
-.digest-section-heading { color: #193532; font-weight: 700; margin: 0.1rem 0 0.25rem; }
-.digest-paragraph {
-    color: #283c37; line-height: 1.68; white-space: pre-wrap; overflow-wrap: anywhere;
-}
-@media (max-width: 640px) {
-    .stMainBlockContainer { padding-top: 1.25rem; }
-    .digest-masthead { padding-bottom: 0.7rem; }
-}
-</style>
-"""
 
 
-def _display_date(value: str, language: str, *, with_time: bool = False) -> str:
-    if not value:
-        return ""
-    try:
-        instant = datetime.fromisoformat(value)
-    except ValueError:
-        return value
-    if instant.tzinfo is not None:
-        instant = instant.astimezone(BEIJING)
-    date = (
-        f"{instant:%d %b %Y}"
-        if language == "en"
-        else f"{instant.year} 年 {instant.month} 月 {instant.day} 日"
-    )
-    return f"{date} {instant:%H:%M}" if with_time else date
+def _navigate(query: dict[str, str]) -> None:
+    st.query_params.from_dict(query)
 
 
-def _account_sidebar() -> accounts.Account | None:
-    with st.sidebar:
-        st.header("账号")
-        account_id = st.session_state.get("account_id")
-        if account_id is not None:
-            account = accounts.get_account(account_id)
-            if account is not None:
-                st.text(account.username)
-                if st.button("退出登录"):
-                    del st.session_state["account_id"]
-                    st.rerun()
-                return account
-            del st.session_state["account_id"]
-
-        registration = st.radio(
-            "账号操作", ("登录", "注册"), horizontal=True,
-            key="account_action", label_visibility="collapsed",
-        ) == "注册"
-        with st.form("register" if registration else "login", clear_on_submit=True):
-            username = st.text_input("用户名", key="auth_username", max_chars=64)
-            password = st.text_input(
-                "密码", type="password", key="auth_password", max_chars=256,
-                help="至少 8 个字符。" if registration else None,
-            )
-            email = ""
-            if registration:
-                email = st.text_input("默认邮箱", key="registration_email", max_chars=254)
-            submitted = st.form_submit_button("注册并登录" if registration else "登录", type="primary")
-        if submitted:
-            try:
-                account = (
-                    accounts.register(username, password, email)
-                    if registration
-                    else accounts.authenticate(username, password)
-                )
-            except accounts.AccountError as error:
-                st.error(str(error))
-            else:
-                if account is None:
-                    st.error("用户名或密码不正确。")
-                else:
-                    st.session_state["account_id"] = account.id
-                    st.rerun()
+def _positive_number(value: str | None, maximum: int = edition_service.MAX_ISSUE_ID) -> int | None:
+    if value is None:
         return None
+    if not value.isascii() or not value.isdigit() or len(value) > 19:
+        raise ValueError
+    number = int(value)
+    if not 1 <= number <= maximum:
+        raise ValueError
+    return number
 
 
-def _publish_sidebar(account: accounts.Account) -> tuple[accounts.Account, edition_service.Issue | None]:
-    preferences = account.preferences
-    with st.sidebar:
-        st.header("订阅设置")
-        with st.form("delivery_preferences"):
-            default_email = st.text_input("默认邮箱", account.default_email, key="default_email", max_chars=254)
-            delivery_override = st.text_input(
-                "投递邮箱（可选）", account.delivery_override, key="delivery_override",
-                placeholder="留空时使用默认邮箱", max_chars=254,
-            )
-            schedule_enabled = st.checkbox(
-                "启用每日邮件投递", account.delivery_time is not None, key="schedule_enabled",
-            )
-            delivery_time = st.time_input(
-                "每日投递时间（北京时间）", account.delivery_time or time(7, 30),
-                step=60, key="delivery_time",
-            )
-            topics = st.multiselect(
-                "关注领域",
-                news_editor.CATEGORIES,
-                default=[topic for topic in preferences["topics"] if topic in news_editor.CATEGORIES],
-                help="我的关注版优先采用这些领域与下方的关键词。",
-            )
-            words = st.text_area(
-                "关键词",
-                value="、".join(preferences["keywords"]),
-                placeholder="例如：大模型、芯片、气候",
-                help="可以用逗号、顿号或换行分隔。",
-            )
-            delivery_mode = st.radio(
-                "邮件版式",
-                tuple(MODE_LABELS),
-                index=tuple(MODE_LABELS).index(preferences["delivery_mode"]),
-                format_func=MODE_LABELS.__getitem__,
-            )
-            delivery_language = st.radio(
-                "邮件语言",
-                tuple(LANGUAGE_LABELS),
-                index=tuple(LANGUAGE_LABELS).index(preferences["delivery_language"]),
-                format_func=LANGUAGE_LABELS.__getitem__,
-                horizontal=True,
-            )
-            saved = st.form_submit_button("保存订阅设置")
-        if saved:
-            keywords = list(
-                dict.fromkeys(
-                    word.strip() for word in re.split(r"[,，、\n]+", words) if word.strip()
-                )
-            )
-            try:
-                if schedule_enabled and delivery_time is None:
-                    raise accounts.AccountError("请选择每日投递时间。")
-                account = accounts.save_settings(
-                    account.id,
-                    default_email=default_email,
-                    delivery_override=delivery_override,
-                    delivery_time=delivery_time if schedule_enabled else None,
-                    preferences={
-                        "topics": topics,
-                        "keywords": keywords,
-                        "delivery_mode": delivery_mode,
-                        "delivery_language": delivery_language,
-                    },
-                )
-            except edition_service.MorningError as error:
-                st.error(str(error))
-            else:
-                st.success("订阅设置已保存。")
-
-        st.divider()
-        if account.delivery_time is not None:
-            st.text(f"每日 {account.delivery_time:%H:%M}（北京时间） · {account.delivery_email}")
-        else:
-            st.caption("每日邮件投递已关闭。")
-        if st.button("生成并发布", type="primary"):
-            try:
-                with st.spinner("正在采集新闻、整理并发布本期…"):
-                    issue = edition_service.publish(account_id=account.id)
-            except edition_service.MorningError as error:
-                st.error(str(error))
-            else:
-                st.success(f"第 {issue['id']} 期已发布。")
-                return account, issue
-    return account, None
+def _date_label(issue: edition_service.Issue, language: str) -> str:
+    value = issue.get("slot") or issue["created_at"]
+    when = datetime.fromisoformat(value)
+    if when.tzinfo is not None:
+        when = when.astimezone(BEIJING)
+    if language == "en":
+        return f"{when:%Y-%m-%d} · {'Evening' if issue['edition'] == 'evening' else 'Morning'}"
+    return f"{when:%Y-%m-%d} · {'晚报' if issue['edition'] == 'evening' else '晨报'}"
 
 
-def _update_view_query() -> None:
-    st.query_params["mode"] = st.session_state["reader_mode"]
-    st.query_params["lang"] = st.session_state["reader_language"]
-
-
-def _clear_issue_query() -> None:
-    if "issue" in st.query_params:
-        del st.query_params["issue"]
-
-
-def _body_section(title: str, body: str) -> None:
-    st.markdown(
-        f'<div class="digest-section-heading">{escape(title)}</div>'
-        f'<div class="digest-paragraph">{escape(body)}</div>',
-        unsafe_allow_html=True,
+def _metadata(article: dict, issue: edition_service.Issue, language: str) -> str:
+    category = article["category"]
+    if language == "en":
+        category = ENGLISH_CATEGORIES.get(category, category)
+    number = f"第 {issue['id']} 期" if language == "zh" else f"Issue {issue['id']}"
+    return (
+        f'<div class="digest-meta"><span class="digest-topic">{escape(category)}</span>'
+        f'<span>{number}</span><span>{escape(_date_label(issue, language))}</span></div>'
     )
 
 
-def _valid_link(url: str) -> bool:
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return False
-    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
-
-
-def _article_audio(copy: dict, language: str, widget_key: str) -> None:
-    script = "\n\n".join(copy[key] for key in ("title", "summary", "background", "why_it_matters"))
-    audio_key = sha256((language + "\n" + script).encode()).hexdigest()
-    cache = st.session_state.setdefault("article_audio", {})
+def _audio_button(
+    copy: dict, language: str, account: accounts.Account | None, key: str,
+) -> bytes | None:
     label = "生成朗读" if language == "zh" else "Generate audio"
-    if audio_key not in cache and st.button(label, key=widget_key):
+    if account is None:
+        st.button(label, key=key, icon=":material/headphones:", on_click=web_settings.open_settings,
+                  args=("登录信息",))
+        return None
+    details, analysis = news_editor.reading_sections(copy)
+    script = "\n\n".join(part for part in (copy["title"], details, analysis) if part)
+    audio_key = sha256(f"{account.id}\n{language}\n{script}".encode()).hexdigest()
+    cache = st.session_state.setdefault("article_audio", {})
+    if audio_key in cache:
+        return cache[audio_key]
+    if st.button(label, key=key, icon=":material/headphones:"):
         try:
             with st.spinner("正在合成朗读…" if language == "zh" else "Generating audio…"):
-                audio = news_editor.synthesize(script)
-        except news_editor.EditorError:
-            st.error(
-                "朗读暂时不可用，可以稍后重试。"
-                if language == "zh"
-                else "Audio unavailable. Try again."
-            )
+                with accounts.model_context(account):
+                    audio = news_editor.synthesize(script)
+        except news_editor.EditorError as error:
+            st.error(str(error))
         else:
             if len(cache) >= MAX_AUDIO_FILES:
                 del cache[next(iter(cache))]
             cache[audio_key] = audio
-    if audio_key in cache:
-        st.audio(cache[audio_key], format="audio/wav")
+            return audio
+    return None
 
 
-def _article_card(article: dict, language: str, widget_key: str) -> None:
-    copy = article[language]
-    chinese = language == "zh"
-    category = article["category"]
-    if not chinese:
-        category = ENGLISH_CATEGORIES.get(category, category)
-    date = _display_date(article["published_at"], language)
-    metadata_parts = [category, article["source_name"], date]
-    if article.get("supplemental"):
-        metadata_parts.append("跨领域补充" if chinese else "From across topics")
-    metadata = " · ".join(part for part in metadata_parts if part)
-    with st.container(border=True):
-        st.markdown(
-            f'<div class="digest-meta">{escape(metadata)}</div>'
-            f'<h2 class="digest-title">{escape(copy["title"])}</h2>',
-            unsafe_allow_html=True,
-        )
-        with st.expander("摘要、背景与影响" if chinese else "Summary, context and impact"):
-            _body_section("摘要" if chinese else "Summary", copy["summary"])
-            _body_section("背景" if chinese else "Background", copy["background"])
-            _body_section(
-                "AI 解读 · 为什么重要" if chinese else "AI analysis · Why it matters",
-                copy["why_it_matters"],
-            )
-            perspective = article.get("perspective")
-            if perspective and perspective.get(language):
-                heading = "外部观点" if chinese else "Outside perspective"
-                _body_section(f"{heading} · {perspective['author']}", perspective[language])
-                if _valid_link(perspective["source_url"]):
-                    st.link_button(
-                        "查看观点来源" if chinese else "View perspective source",
-                        perspective["source_url"],
-                    )
-        if _valid_link(article["source_url"]):
-            st.link_button(
-                "查看新闻原文" if chinese else "Open source article", article["source_url"]
-            )
-        _article_audio(copy, language, widget_key)
+def _article_detail(
+    article: dict, issue: edition_service.Issue, account: accounts.Account | None,
+    mode: str, lang: str, index: int,
+) -> None:
+    z = lang == "zh"
+    return_query = {"issue": str(issue["id"]), "mode": mode, "lang": lang}
+    if st.query_params.get("from") == "archive":
+        return_query.pop("issue")
+        if page := st.query_params.get("page"):
+            return_query["page"] = page
+    st.button("返回列表" if z else "Back to list", key="back_to_list", icon=":material/arrow_back:",
+              on_click=_navigate, args=(return_query,))
+    copy = article[lang]
+    details, analysis = news_editor.reading_sections(copy)
+    sections = []
+    for title, body in (("详细内容" if z else "Details", details), ("解读和分析" if z else "Analysis", analysis)):
+        sections.append(f"<h3>{title}</h3>")
+        for paragraph in body.split("\n\n"):
+            if paragraph.strip():
+                sections.append(f"<p>{escape(paragraph.strip())}</p>")
+    url = article.get("source_url", "")
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        parsed = None
+    if parsed and parsed.scheme in ("http", "https") and parsed.hostname:
+        source = article.get("source_name") or parsed.hostname
+        caption = "查看原文" if z else "Read source"
+        sections.append(f'<a class="digest-source" href="{escape(url, quote=True)}" '
+                        f'target="_blank" rel="noopener noreferrer">{caption} · {escape(source)}</a>')
+    st.markdown(
+        f'<article class="digest-detail"><h2>{escape(copy["title"])}</h2>'
+        f'{_metadata(article, issue, lang)}{"".join(sections)}</article>',
+        unsafe_allow_html=True,
+    )
+    if audio := _audio_button(copy, lang, account, f"audio_detail_{issue['id']}_{mode}_{index}"):
+        st.audio(audio, format="audio/wav")
+
+
+def _issue_rows(
+    issue: edition_service.Issue, account: accounts.Account | None, mode: str, lang: str,
+    *, latest: bool, archive_page: int | None,
+) -> None:
+    if not issue[mode]:
+        return
+    group = "latest" if latest else "past"
+    with st.container(key=f"batch_{group}_{issue['id']}"):
+        for index, article in enumerate(issue[mode], 1):
+            key = f"{issue['id']}_{mode}_{index}"
+            copy = article[lang]
+            with st.container(key=f"story_{key}"):
+                text, actions = st.columns([3.3, 1.8], gap="small", vertical_alignment="center")
+                text.markdown(
+                    f'<div class="digest-story-title" role="heading" aria-level="2">{escape(copy["title"])}</div>'
+                    + _metadata(article, issue, lang), unsafe_allow_html=True,
+                )
+                with actions.container(horizontal=True, horizontal_alignment="right", gap="xsmall"):
+                    detail = {"issue": str(issue["id"]), "article": str(index), "mode": mode, "lang": lang}
+                    if archive_page is not None:
+                        detail.update({"from": "archive", "page": str(archive_page)})
+                    st.button("详细浏览" if lang == "zh" else "Read story", key=f"detail_{key}",
+                              icon=":material/arrow_outward:", on_click=_navigate, args=(detail,))
+                    audio = _audio_button(copy, lang, account, f"audio_{key}")
+                if audio:
+                    st.audio(audio, format="audio/wav")
+
+
+def _reader(account: accounts.Account | None, mode: str, lang: str) -> None:
+    account_id = account.id if account is not None else None
+    z = lang == "zh"
+    try:
+        issue_id = _positive_number(st.query_params.get("issue"))
+    except ValueError:
+        st.warning("晨报链接中的期号无效。")
+        return
+    try:
+        article_id = _positive_number(st.query_params.get("article"))
+        page = _positive_number(st.query_params.get("page"), 1_000_000) or 1
+    except ValueError:
+        st.warning("报道链接无效。" if z else "Invalid story link.")
+        return
+    if article_id is not None and issue_id is None:
+        st.warning("报道链接无效。" if z else "Invalid story link.")
+        return
+    query = {"mode": mode, "lang": lang}
+    if issue_id is not None:
+        issue = edition_service.get_issue(issue_id, account_id=account_id)
+        if issue is None:
+            st.warning("未找到这期晨报。")
+            if account is None:
+                st.button("登录查看个人日报" if z else "Sign in for private editions",
+                          on_click=web_settings.open_settings, args=("登录信息",))
+            return
+        if article_id is not None:
+            if article_id > len(issue[mode]):
+                st.warning("报道链接无效。" if z else "Invalid story link.")
+            else:
+                _article_detail(issue[mode][article_id - 1], issue, account, mode, lang, article_id)
+            return
+        st.button("全部报道" if z else "All stories", icon=":material/arrow_back:",
+                  on_click=_navigate, args=(query,))
+        newest = edition_service.list_issues(account_id=account_id, mode=mode, limit=1)
+        _issue_rows(issue, account, mode, lang, latest=bool(newest and newest[0]["id"] == issue_id),
+                    archive_page=None)
+        if not issue[mode]:
+            st.info("本期这个版式没有新闻。" if z else "No stories in this edition.")
+        return
+
+    issues = edition_service.list_issues(account_id=account_id, mode=mode, offset=(page - 1) * PAGE_SIZE,
+                                         limit=PAGE_SIZE + 1)
+    if not any(item[mode] for item in issues[:PAGE_SIZE]):
+        st.info("暂无可阅读的报道。" if z else "No stories to display.")
+    for pos, issue in enumerate(issues[:PAGE_SIZE]):
+        _issue_rows(issue, account, mode, lang, latest=(page == 1 and pos == 0), archive_page=page)
+    if page != 1 or len(issues) > PAGE_SIZE:
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            if page > 1:
+                st.button("上一页" if z else "Previous", on_click=_navigate, args=({**query, "page": str(page - 1)},))
+            if len(issues) > PAGE_SIZE:
+                st.button("下一页" if z else "Next", on_click=_navigate, args=({**query, "page": str(page + 1)},))
 
 
 def main() -> None:
-    st.set_page_config(page_title="通勤晨报与晚报", layout="wide", initial_sidebar_state="auto")
-    st.markdown(STYLE, unsafe_allow_html=True)
-
+    st.set_page_config(page_title="通勤日报", layout="wide", initial_sidebar_state="auto")
     try:
-        account = _account_sidebar()
-        just_published = None
-        if account is not None:
-            account, just_published = _publish_sidebar(account)
-        preferences = account.preferences if account is not None else edition_service.get_preferences()
+        account = web_settings.current_account()
+        apply_style(*web_settings.appearance(account))
+        mode, lang = web_settings.reading(account)
+        web_settings.sidebar(account, mode, lang)
+        st.markdown('<header class="digest-masthead"><h1>通勤日报</h1></header>', unsafe_allow_html=True)
+        _reader(account, mode, lang)
+        if st.session_state.get("settings_open"):
+            web_settings.settings_dialog(account, mode, lang)
     except edition_service.MorningError as error:
-        st.title("通勤晨报")
         st.error(str(error))
-        return
-
-    if just_published is not None:
-        st.query_params["issue"] = str(just_published["id"])
-
-    issue_arg = st.query_params.get("issue")
-    mode_arg = st.query_params.get("mode")
-    lang_arg = st.query_params.get("lang")
-    default_mode = mode_arg if mode_arg in MODE_LABELS else preferences["delivery_mode"]
-    default_lang = lang_arg if lang_arg in LANGUAGE_LABELS else preferences["delivery_language"]
-
-    masthead = st.empty()
-    view_column, language_column = st.columns([3, 2])
-    with view_column:
-        mode = st.radio(
-            "阅读版式",
-            tuple(MODE_LABELS),
-            index=tuple(MODE_LABELS).index(default_mode),
-            format_func=MODE_LABELS.__getitem__,
-            horizontal=True,
-            key="reader_mode",
-            on_change=_update_view_query,
-        )
-    with language_column:
-        language = st.radio(
-            "阅读语言",
-            tuple(LANGUAGE_LABELS),
-            index=tuple(LANGUAGE_LABELS).index(default_lang),
-            format_func=LANGUAGE_LABELS.__getitem__,
-            horizontal=True,
-            key="reader_language",
-            on_change=_update_view_query,
-        )
-
-    issue = just_published
-    invalid_issue = False
-    load_error = ""
-    if issue is None:
-        try:
-            issue_id = int(issue_arg) if issue_arg is not None else None
-            if issue_id is not None and not 1 <= issue_id <= edition_service.MAX_ISSUE_ID:
-                raise ValueError("An issue number is outside the database ID range.")
-        except ValueError:
-            invalid_issue = True
-        else:
-            try:
-                issue = edition_service.get_issue(issue_id, account_id=account.id if account else None)
-            except edition_service.MorningError as error:
-                load_error = str(error)
-
-    title = "通勤晨报" if language == "zh" else "Commute Digest"
-    dateline = ""
-    articles = []
-    if issue is not None:
-        articles = issue["cross"] if mode == "cross" else issue["focus"]
-        if issue.get("edition") == "evening":
-            title = "通勤晚报" if language == "zh" else "Commute Evening Digest"
-        elif language == "en" and issue.get("window_end"):
-            title = "Commute Morning Digest"
-        date = _display_date(issue["created_at"], language)
-        window_start = issue.get("window_start")
-        window_end = issue.get("window_end")
-        if window_start and window_end:
-            start = _display_date(window_start, language, with_time=True)
-            end = _display_date(window_end, language, with_time=True)
-            timezone = "北京时间" if language == "zh" else "Beijing time"
-            date = f"{start} – {end} {timezone}"
-        count = len(articles)
-        edition = f"第 {issue['id']} 期" if language == "zh" else f"Issue {issue['id']}"
-        story_count = (
-            f"{count} 条新闻"
-            if language == "zh"
-            else f"{count} {'stories' if count != 1 else 'story'}"
-        )
-        details = " · ".join(part for part in (edition, date, story_count) if part)
-        dateline = f'<div class="digest-dateline">{escape(details)}</div>'
-    masthead.markdown(
-        f'<header class="digest-masthead"><h1>{title}</h1>{dateline}</header>',
-        unsafe_allow_html=True,
-    )
-
-    if issue_arg is not None and just_published is None:
-        st.button("查看最新一期", on_click=_clear_issue_query)
-    if load_error:
-        st.error(load_error)
-    elif invalid_issue:
-        st.warning("晨报链接中的期号无效。")
-    elif issue is None and issue_arg is not None:
-        st.warning("未找到这期晨报。")
-    elif issue is None:
-        if account is None:
-            st.info("还没有已发布的新闻简报。登录后可以生成并发布第一期。")
-        else:
-            st.info("还没有已发布的新闻简报。可以在侧栏生成并发布第一期。")
-    elif not articles:
-        st.info("本期这个版式没有新闻。" if language == "zh" else "No stories in this edition.")
-    else:
-        for index, article in enumerate(articles):
-            _article_card(article, language, f"audio_{issue['id']}_{mode}_{language}_{index}")
 
 
 if __name__ == "__main__":
     main()
+else:
+    # `streamlit run` discovers this ASGI app and executes this same reader as __main__.
+    from pathlib import Path
+    from commute_digest.login_sessions import ROUTES
+
+    app = st.App(Path(__file__).resolve(), routes=ROUTES)

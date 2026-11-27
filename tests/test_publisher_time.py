@@ -6,6 +6,34 @@ import pytest
 from commute_digest import publisher_time
 
 
+def test_excerpt_from_same_verified_page_preserves_paragraphs_and_ignores_sidebar():
+    url = "https://publisher.example/item"
+    html = (
+        '<meta property="article:published_time" content="2026-11-27T03:00:00Z">'
+        '<meta property="og:description" content="Short description">'
+        '<nav><p>Other stories</p></nav><article><p>First <b>reported</b>'
+        '<script>showAds()</script><style>div { color: red; }</style> fact.</p>'
+        '<p>Second reported fact.</p></article>'
+    )
+    assert publisher_time.article_page_from_html(html, url).excerpt == (
+        "First reported fact. Second reported fact."
+    )
+    structured = '<script type="application/ld+json">{"articleBody":"' + "正文" * 800 + '"}</script>'
+    assert publisher_time.article_page_from_html(html + structured, url).excerpt == "正文" * 600
+    assert publisher_time.article_page_from_html(structured, url) is None
+
+
+def test_metadata_summary_and_navigation_are_not_treated_as_reporting():
+    url = "https://publisher.example/a"
+    meta = '<meta property="article:published_time" content="2026-11-27T03:00:00Z">'
+    summary = '<meta property="og:description" content="The search summary alone">'
+    assert publisher_time.article_page_from_html(meta + summary, url).excerpt == ""
+    html = ('<div itemprop="articleBody"><p>实际报道的第一段。</p>'
+            '<aside><p>另一个话题。</p></aside><div class="related-articles"><p>相邻新闻。</p></div>'
+            '<p>报道的第二段。</p></div>')
+    assert publisher_time.article_page_from_html(meta + html, url).excerpt == "实际报道的第一段。 报道的第二段。"
+
+
 @pytest.mark.parametrize(
     ("html", "url", "expected"),
     [

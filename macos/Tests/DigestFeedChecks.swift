@@ -40,12 +40,17 @@ struct DigestFeedChecks {
         precondition(BeijingSchedule.refresh(after: nextEvening, latestSlot: morning.slot) == staleRetry)
         precondition(BeijingSchedule.refresh(after: nextEvening, latestSlot: evening.slot) == tomorrowMorning)
 
-        let credentials = try ReadingCredentials(baseURL: "https://news.example:443/", username: "reader", password: "example")
-        let restored = try JSONDecoder().decode(ReadingCredentials.self, from: JSONEncoder().encode(credentials))
+        let credentials = try SiteConnection(baseURL: "https://news.example:443/")
+        let restored = try JSONDecoder().decode(SiteConnection.self, from: JSONEncoder().encode(credentials))
         precondition(restored == credentials && restored.origin.absoluteString == "https://news.example")
-        precondition(ReadingCredentials.approvedOrigin("https://reader:secret@news.example") == nil)
-        precondition(ReadingCredentials.approvedOrigin("https://news.example/unsafe") == nil)
-        precondition(ReadingCredentials.approvedOrigin("http://news.example") == nil)
+        let legacy = Data(#"{"baseURL":"https://news.example","username":"reader","password":"old"}"#.utf8)
+        let migrated = try JSONDecoder().decode(SiteConnection.self, from: legacy)
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(migrated)) as? [String: String]
+        precondition(encoded == ["baseURL": "https://news.example"])
+
+        precondition(SiteConnection.approvedOrigin("https://reader:secret@news.example") == nil)
+        precondition(SiteConnection.approvedOrigin("https://news.example/unsafe") == nil)
+        precondition(SiteConnection.approvedOrigin("http://news.example") == nil)
         print("Digest feed, deep links and Beijing refresh checks passed")
     }
 

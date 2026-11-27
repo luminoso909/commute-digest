@@ -66,6 +66,32 @@ def test_publish_saves_preferences_and_permalinks(sample_issue):
     assert edition_service.get_issue(latest["id"] + 1) is None
 
 
+def test_archive_orders_visible_publication_slots_before_paginating(widget_storage):
+    local = {"title": "标题", "summary": "邮件用摘要", "details": "原文细节", "analysis": "分析内容"}
+    story = {"zh": local, "en": local}
+    records = [
+        (1, "2026-11-24T05:00:00+08:00", None, None, [story]),
+        (2, "2026-11-24T17:01:00+08:00", "2026-11-24T17:00:00+08:00", None, [story]),
+        (3, "2026-11-25T17:01:00+08:00", "2026-11-25T17:00:00+08:00", 22, [story]),
+        (4, "2026-11-25T18:00:00+08:00", "2026-11-24T05:00:00+08:00", 11, [story]),
+        (5, "2026-11-26T05:01:00+08:00", "2026-11-26T05:00:00+08:00", None, []),
+    ]
+    with edition_service._database() as connection:
+        for number, created, slot, owner, focus in records:
+            payload = {"cross": [story], "focus": focus}
+            if slot:
+                payload["slot"] = slot
+            connection.execute("INSERT INTO issues VALUES (?, ?, ?)", (number, created, json.dumps(payload)))
+            if owner:
+                connection.execute("INSERT INTO issue_owners VALUES (?, ?)", (number, owner))
+
+    assert [item["id"] for item in edition_service.list_issues()] == [5, 2, 1]
+    assert [item["id"] for item in edition_service.list_issues(account_id=11, mode="focus")] == [2, 4, 1]
+    assert [item["id"] for item in edition_service.list_issues(account_id=22, offset=1, limit=2)] == [3, 2]
+    assert edition_service.get_issue(3, account_id=11) is None
+    assert edition_service.get_issue(3, account_id=22)["focus"][0]["zh"] == local
+
+
 @pytest.fixture
 def mail_configuration(monkeypatch):
     configuration = {
@@ -117,6 +143,7 @@ def test_email_preserves_article_links_and_localized_copy_in_both_alternatives(
     local = story[language]
     local["title"] += " <literal> & example"
     local["summary"] += " <summary example> & details"
+    local.update(details="长文细节只在网页显示", analysis="长文分析只在网页显示")
     other_mode = "cross" if mode == "focus" else "focus"
     other_language = "zh" if language == "en" else "en"
 
@@ -141,6 +168,10 @@ def test_email_preserves_article_links_and_localized_copy_in_both_alternatives(
     assert f'href="{escape(source_url)}"' in html
     assert f">{escape(source_url)}<" in html
     assert f'href="{escape(issue_url)}"' in html
+    assert f'href="{escape(issue_url)}&amp;article=1"' in html
+    for section in (local["details"], local["analysis"]):
+        assert section not in plain
+        assert section not in html
     assert "<literal>" not in html
     assert "<summary example>" not in html
     for unrelated in (story[other_language]["title"], issue[other_mode][0][language]["title"]):
@@ -377,7 +408,10 @@ def test_streamlit_opens_mailing_permalink_and_switches_editions(sample_issue):
 
     assert not app.exception
     assert any("Technology update" in element.value for element in app.markdown)
-    app.radio(key="reader_mode").set_value("cross").run()
+    next(button for button in app.button if button.label == "设置").click().run()
+    app.radio(key="settings_page").set_value("阅读设置").run()
+    app.radio(key="reader_mode").set_value("cross")
+    next(button for button in app.button if button.label == "保存").click().run()
     assert not app.exception
     assert any("Science update" in element.value for element in app.markdown)
 

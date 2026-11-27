@@ -1,4 +1,4 @@
-"""Publish and deliver the single subscriber's morning and evening briefings."""
+"""管理通勤日报的期次、邮件和小组件快照。命令行投递使用共享收件邮箱。"""
 
 import argparse
 import json
@@ -8,7 +8,7 @@ import sqlite3
 import ssl
 import sys
 from collections.abc import Iterator, Sequence
-from contextlib import closing, contextmanager, suppress
+from contextlib import closing, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from email.errors import HeaderParseError
@@ -21,6 +21,7 @@ from typing import NotRequired, TypedDict
 from urllib.parse import urlencode, urlsplit
 
 from . import news_editor
+from .delivery_lock import delivery_in_progress
 from .schedule import (
     BEIJING,
     EVENING_TIME,
@@ -136,7 +137,7 @@ def _validated_preferences(
     topics: list[str], keywords: list[str], delivery_mode: str, delivery_language: str
 ) -> Preferences:
     if any(topic not in news_editor.CATEGORIES for topic in topics):
-        raise MorningError("请在四个现有板块中选择。")
+        raise MorningError("请选择列表中的新闻领域。")
     if delivery_mode not in {"cross", "focus"} or delivery_language not in {"zh", "en"}:
         raise MorningError("请选择有效的邮件版本和语言。")
     return {
@@ -189,15 +190,24 @@ def _publish(
     exclude_articles: Sequence[dict] = (),
     account_id: int | None = None,
 ) -> Issue:
+    selection = nullcontext()
+    if account_id is not None:
+        from . import accounts
+
+        account = accounts.get_account(account_id)
+        if account is None:
+            raise MorningError("请重新登录后再生成简报。")
+        selection = accounts.model_context(account)
     try:
-        digest = news_editor.generate_digest(
-            preferences["topics"],
-            preferences["keywords"],
-            now=slot,
-            window_start=slot - SLOT_INTERVAL,
-            exclude_articles=exclude_articles,
-            required_mode=preferences["delivery_mode"],
-        )
+        with selection:
+            digest = news_editor.generate_digest(
+                preferences["topics"],
+                preferences["keywords"],
+                now=slot,
+                window_start=slot - SLOT_INTERVAL,
+                exclude_articles=exclude_articles,
+                required_mode=preferences["delivery_mode"],
+            )
     except news_editor.EditorError as exc:
         raise MorningError(str(exc)) from exc
 
@@ -226,17 +236,46 @@ def publish(*, account_id: int | None = None) -> Issue:
     return _publish(account.preferences, slot, account_id=account.id)
 
 
+_VISIBLE_ISSUES = """
+    SELECT issues.id, created_at, payload FROM issues
+    LEFT JOIN issue_owners ON issue_owners.issue_id = issues.id
+    WHERE (issue_owners.account_id IS NULL OR issue_owners.account_id = ?)
+"""
+
+
+def list_issues(
+    *, account_id: int | None = None, offset: int = 0, limit: int = 15, mode: str | None = None,
+) -> list[Issue]:
+    """Page shared and owned issues together. Older issues may predate the slot field."""
+    if offset < 0 or not 1 <= limit <= 100:
+        raise MorningError("无效的历史页码。")
+    if mode is not None and mode not in {"focus", "cross"}:
+        raise MorningError("请选择有效的阅读版式。")
+    query = _VISIBLE_ISSUES
+    parameters = [account_id]
+    if mode is not None:
+        query += " AND json_array_length(payload, ?) > 0"
+        parameters.append(f"$.{mode}")
+    with _database() as connection:
+        rows = connection.execute(
+            query + """
+            ORDER BY julianday(COALESCE(json_extract(payload, '$.slot'), created_at)) DESC,
+                     julianday(created_at) DESC, issues.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*parameters, limit, offset),
+        ).fetchall()
+    return [_issue_from_payload(issue_id, created, json.loads(payload)) for issue_id, created, payload in rows]
+
+
 def get_issue(issue_id: int | None = None, *, account_id: int | None = None) -> Issue | None:
+    if issue_id is None:
+        latest = list_issues(account_id=account_id, limit=1)
+        return latest[0] if latest else None
     with _database() as connection:
         row = connection.execute(
-            """
-            SELECT issues.id, created_at, payload FROM issues
-            LEFT JOIN issue_owners ON issue_owners.issue_id = issues.id
-            WHERE (issue_owners.account_id IS NULL OR issue_owners.account_id = ?)
-              AND (? IS NULL OR issues.id = ?)
-            ORDER BY issues.id DESC LIMIT 1
-            """,
-            (account_id, issue_id, issue_id),
+            _VISIBLE_ISSUES + " AND issues.id = ?",
+            (account_id, issue_id),
         ).fetchone()
     if row is None:
         return None
@@ -411,9 +450,13 @@ def _make_message(
     lines = [subject, dateline] if dateline != day else [subject]
     stories = []
     articles = issue["cross"] if mode == "cross" else issue["focus"]
-    for article in articles:
+    for number, article in enumerate(articles, start=1):
         local = article[language]
         lines.extend(("", local["title"], local["summary"]))
+        headline = escape(local["title"])
+        if issue_link:
+            detail_link = f"{issue_link}&article={number}"
+            headline = f'<a href="{escape(detail_link)}" style="color:inherit;text-decoration:none">{headline}</a>'
         source_url = news_editor._source_url(article.get("source_url"))
         source_html = ""
         if source_url:
@@ -432,7 +475,7 @@ def _make_message(
         stories.append(f"""
           <div style="border-top:1px solid #dbe3ed;padding:18px 0">
             <h2 style="font-family:{heading_font};font-size:21px;font-weight:700;
-                       line-height:1.35;margin:0 0 8px;color:#12253c">{escape(local["title"])}</h2>
+                       line-height:1.35;margin:0 0 8px;color:#12253c">{headline}</h2>
             <p style="{body_style}">{escape(local["summary"])}</p>
             {source_html}
           </div>""")
@@ -532,6 +575,7 @@ def _delivery_status(
             )
 
 
+@delivery_in_progress()
 def deliver_slot(slot: datetime | None = None, *, verification: bool = False) -> str:
     now = datetime.now(BEIJING)
     expected = (
