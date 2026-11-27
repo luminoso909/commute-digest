@@ -175,8 +175,11 @@
                 CLANG_ENABLE_MODULES = YES;
                 CODE_SIGN_IDENTITY = "-";
                 CODE_SIGN_STYLE = Manual;
+                DEPLOYMENT_POSTPROCESSING = YES;
+                GCC_GENERATE_DEBUGGING_SYMBOLS = NO;
                 MACOSX_DEPLOYMENT_TARGET = 14.0;
                 SDKROOT = macosx;
+                STRIP_INSTALLED_PRODUCT = YES;
                 SWIFT_COMPILATION_MODE = wholemodule;
                 SWIFT_OPTIMIZATION_LEVEL = "-O";
                 SWIFT_VERSION = 5.0;

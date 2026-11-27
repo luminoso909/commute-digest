@@ -62,7 +62,7 @@ if [[ "$mode" == --package ]]; then
     mkdir -p "$folder" "$here/../dist"
     ditto "$bundle" "$folder/CommuteDigest.app"
     cp -p "$0" "$folder/安装小组件.command"
-    ditto -c -k --keepParent "$folder" "$work/package.zip"
+    ditto -c -k --norsrc --noextattr --noqtn --noacl --keepParent "$folder" "$work/package.zip"
     mv -f "$work/package.zip" "$here/../dist/CommuteDigest-macOS.zip"
     echo "已生成 $here/../dist/CommuteDigest-macOS.zip"
     exit 0
