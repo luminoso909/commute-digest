@@ -2,6 +2,8 @@ import Foundation
 import Security
 
 struct SiteConnection: Codable, Equatable {
+    static let defaultOrigin = URL(string: "https://frosty-gizzard-chase.ngrok-free.dev")!
+
     let origin: URL
     let accountID: String
     let password: String

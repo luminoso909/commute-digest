@@ -448,12 +448,13 @@ def latest_widget_issue(account_id: int) -> WidgetIssue | None:
     with _database() as connection:
         rows = connection.execute(
             """
-            SELECT d.slot, a.issue_number, i.id, d.settings_key, i.payload
+            SELECT CASE WHEN d.slot LIKE 'debug:%' THEN d.scheduled_at ELSE d.slot END AS publication_slot,
+                   a.issue_number, i.id, d.settings_key, i.payload
             FROM subscription_deliveries AS d
             JOIN account_issues AS a ON a.issue_id = d.issue_id AND a.account_id = d.account_id
             JOIN issues AS i ON i.id = a.issue_id
             WHERE d.account_id = ? AND d.status = 'sent'
-            ORDER BY d.slot DESC
+            ORDER BY publication_slot DESC, i.id DESC
             """,
             (account_id,),
         )

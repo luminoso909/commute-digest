@@ -57,6 +57,45 @@ def test_configuration_is_noninteractive_reusable_and_preserves_original_files(c
     assert "--traffic-policy-file" not in cmd and "--config" in cmd
 
 
+def test_first_setup_records_gmail_sender_and_defaults_recipient_to_it(cloud, monkeypatch):
+    monkeypatch.setenv("SMTP_USER", "sender@example.org")
+    monkeypatch.delenv("RECIPIENT_EMAIL")
+    env = cloud.configure()
+    assert env["SMTP_FROM"] == env["RECIPIENT_EMAIL"] == "sender@example.org"
+    written = cloud.ENV.read_text()
+    assert "SMTP_FROM=sender@example.org\n" in written
+    assert "RECIPIENT_EMAIL=sender@example.org\n" in written
+
+
+def test_service_login_prompts_for_authorized_sender_and_keeps_it_on_restart(cloud, monkeypatch):
+    monkeypatch.setenv("SMTP_USER", "smtp-service-account")
+    monkeypatch.delenv("RECIPIENT_EMAIL")
+    with pytest.raises(ValueError, match="SMTP_FROM"):
+        cloud.configure()
+    assert not cloud.ENV.exists()
+    monkeypatch.setattr(cloud.sys.stdin, "isatty", lambda: True)
+    questions = []
+    replies = iter(("digest@example.org", ""))
+    def respond(prompt):
+        questions.append(prompt)
+        return next(replies)
+    monkeypatch.setattr("builtins.input", respond)
+    env = cloud.configure()
+    assert "发件邮箱" in questions[0] and "[digest@example.org]" in questions[1]
+    assert env["SMTP_FROM"] == env["RECIPIENT_EMAIL"] == "digest@example.org"
+    original = cloud.ENV.read_bytes()
+    assert cloud.configure()["SMTP_USER"] == "smtp-service-account"
+    assert cloud.ENV.read_bytes() == original
+
+
+@pytest.mark.parametrize("key", ["SMTP_FROM", "RECIPIENT_EMAIL"])
+def test_reject_invalid_mail_addresses_before_writing_configuration(cloud, monkeypatch, key):
+    monkeypatch.setenv(key, "smtp-login")
+    with pytest.raises(ValueError, match=key):
+        cloud.configure()
+    assert not cloud.ENV.exists()
+
+
 def test_start_is_idempotent_and_repairs_individual_services(cloud, monkeypatch):
     state = {}
     launches, stops, installs = [], [], []

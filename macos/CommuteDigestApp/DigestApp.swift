@@ -72,10 +72,10 @@ private final class DigestAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        didHandleURL = true
-        guard let origin = SettingsStore.origin ?? (try? DigestKeychain.read())?.origin else { return }
+        let origin = SettingsStore.origin ?? (try? DigestKeychain.read())?.origin ?? SiteConnection.defaultOrigin
         for url in urls {
-            if let destination = DigestLink(widgetURL: url)?.browserURL(origin: origin) {
+            if let destination = DigestLink.destination(for: url, origin: origin) {
+                didHandleURL = true
                 NSWorkspace.shared.open(destination)
                 break
             }
@@ -104,7 +104,7 @@ private final class DigestAppDelegate: NSObject, NSApplicationDelegate {
 }
 
 private struct ConnectionSettings: View {
-    @State private var address = SettingsStore.origin?.absoluteString ?? ""
+    @State private var address = (SettingsStore.origin ?? SiteConnection.defaultOrigin).absoluteString
     @State private var accountID = ""
     @State private var password = ""
     @State private var connected = false

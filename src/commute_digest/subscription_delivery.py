@@ -75,7 +75,9 @@ def _settings_key(account: accounts.Account, due: datetime) -> str:
                       sort_keys=True)
 
 
-def _claim(account: accounts.Account, due: datetime, now: datetime) -> tuple[str, int | None] | None:
+def _claim(
+    account: accounts.Account, due: datetime, now: datetime, *, trial_key: str | None = None,
+) -> tuple[str, int | None] | None:
     claim = uuid4().hex
     with edition_service._database() as connection:
         row = connection.execute(
@@ -95,14 +97,15 @@ def _claim(account: accounts.Account, due: datetime, now: datetime) -> tuple[str
                 status = 'building',
                 retry_at = NULL
             WHERE status = 'cancelled'
-               OR (status = 'failed' AND settings_key != :settings)
-               OR (status = 'retry' AND (retry_at <= :now OR settings_key != :settings))
+               OR (status = 'failed' AND (:manual OR settings_key != :settings))
+               OR (status = 'retry' AND (:manual OR retry_at <= :now OR settings_key != :settings))
                OR (status = 'building' AND claimed_at <= :expired)
             RETURNING issue_id
             """,
             {
                 "id": account.id,
-                "slot": latest_slot(due).isoformat(),
+                "slot": trial_key or latest_slot(due).isoformat(),
+                "manual": trial_key is not None,
                 "day": due.date().isoformat(),
                 "due": due.isoformat(),
                 "settings": _settings_key(account, due),
@@ -124,10 +127,12 @@ def _set_status(
     with edition_service._database() as connection:
         result = connection.execute(
             """
-            UPDATE subscription_deliveries SET status = ?, issue_id = ?, retry_at = ?
+            UPDATE subscription_deliveries SET status = ?, issue_id = ?, retry_at = ?,
+                claimed_at = COALESCE(?, claimed_at)
             WHERE claim = ? AND status = ?
             """,
-            (status, issue_id, retry_at.isoformat() if retry_at else None, claim, previous),
+            (status, issue_id, retry_at.isoformat() if retry_at else None,
+             datetime.now(BEIJING).isoformat() if status == "sending" else None, claim, previous),
         )
         return result.rowcount == 1
 
@@ -136,20 +141,18 @@ def _report(account: accounts.Account, message: str) -> None:
     print(f"账号 {account.id} · {message}", file=sys.stderr, flush=True)
 
 
-@delivery_in_progress()
-def _deliver(account: accounts.Account, due: datetime, now: datetime) -> bool:
-    job = _claim(account, due, now)
-    if job is None:
-        return False
-
+def send_claimed_issue(
+    account: accounts.Account, due: datetime, now: datetime, job: tuple[str, int | None],
+    *, trial: bool = False,
+) -> edition_service.Issue:
+    """Generate or reuse the claimed private issue and record SMTP's outcome."""
     claim, issue_id = job
     retry_at = now + SMTP_RETRY_DELAY
     try:
         settings = edition_service._mail_settings(account.delivery_email)
-    except edition_service.MorningError as error:
+    except edition_service.MorningError:
         _set_status(claim, "building", "retry", issue_id, retry_at)
-        _report(account, str(error))
-        return False
+        raise
 
     try:
         issue = edition_service.get_issue(issue_id, account_id=account.id) if issue_id else None
@@ -158,33 +161,43 @@ def _deliver(account: accounts.Account, due: datetime, now: datetime) -> bool:
                 account.preferences, latest_slot(due), account_id=account.id,
             )
         message = edition_service._make_message(
-            issue, account.preferences, settings, due.date().isoformat(),
+            issue, account.preferences, settings, due.date().isoformat(), verification=trial,
         )
-    except edition_service.MorningError as error:
+    except edition_service.MorningError:
         _set_status(claim, "building", "failed")
-        _report(account, str(error))
-        return False
+        raise
 
     current = accounts.get_account(account.id)
-    if (current is None or not current.delivery_enabled or current.delivery_email != account.delivery_email
+    if (current is None or (not trial and not current.delivery_enabled) or current.delivery_email != account.delivery_email
             or _settings_key(current, due) != _settings_key(account, due)):
         _set_status(claim, "building", "cancelled")
-        return False
+        raise edition_service.MorningError("账号的投递设置已更改，本次投递已取消。")
     if not _set_status(claim, "building", "sending", issue["id"]):
-        return False
+        raise edition_service.MorningError("此投递请求已由其他进程接手。")
 
     try:
         edition_service._send_message(message, settings)
-    except edition_service._SMTPSetupError as error:
+    except edition_service._SMTPSetupError:
         _set_status(claim, "sending", "retry", issue["id"], retry_at)
-        _report(account, str(error))
-        return False
-    except (OSError, edition_service.MorningError):
+        raise
+    except (OSError, edition_service.MorningError) as error:
         _set_status(claim, "sending", "unconfirmed", issue["id"])
-        _report(account, "SMTP 未确认接收，请核对发件记录和收件箱。")
-        return False
+        raise edition_service.MorningError("SMTP 未确认接收，请核对发件记录和收件箱。") from error
 
     _set_status(claim, "sending", "sent", issue["id"])
+    return issue
+
+
+@delivery_in_progress()
+def _deliver(account: accounts.Account, due: datetime, now: datetime) -> bool:
+    job = _claim(account, due, now)
+    if job is None:
+        return False
+    try:
+        send_claimed_issue(account, due, now, job)
+    except edition_service.MorningError as error:
+        _report(account, str(error))
+        return False
     print(f"{due:%Y-%m-%d %H:%M} · 账号 {account.id} 的简报已由 SMTP 接收。", flush=True)
     return True
 

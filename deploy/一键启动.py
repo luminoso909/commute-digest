@@ -3,6 +3,8 @@
 import argparse
 from contextlib import ExitStack, closing, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
+from email.errors import HeaderParseError
+from email.headerregistry import Address
 import fcntl
 import getpass
 import hashlib
@@ -37,7 +39,7 @@ SERVICES = {
 
 CONFIG_KEYS = ("PUBLIC_BASE_URL", "DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "NGROK_AUTHTOKEN",
                "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM",
-               "RECIPIENT_EMAIL", "COMMUTE_DB")
+               "RECIPIENT_EMAIL", "COMMUTE_DB", "COMMUTE_DEBUG_DELIVERY")
 HEALTH = "/_stcore/health"
 LOCAL = "http://127.0.0.1:8501"
 WORKERS = {"daily", "accounts"}
@@ -61,6 +63,14 @@ def ngrok_config(env):
     project_config = STATE / "ngrok.yml"
     default_config = Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "ngrok/ngrok.yml"
     return next((path for path in (project_config, default_config) if path.is_file()), None)
+
+
+def is_mailbox(value):
+    try:
+        address = Address(addr_spec=value)
+    except (HeaderParseError, ValueError):
+        return False
+    return bool(address.username and address.domain and address.addr_spec == value and len(value) <= 254)
 
 
 def configure():
@@ -88,9 +98,25 @@ def configure():
     field("DEEPSEEK_API_KEY", "共享日报的 DeepSeek API Key", hidden=True)
     field("SMTP_HOST", "SMTP 服务器", "smtp.gmail.com")
     field("SMTP_PORT", "SMTP TLS 端口", "465")
-    field("SMTP_USER", "发件邮箱")
+    field("SMTP_USER", "你自己的 SMTP 登录账号（Gmail 填完整发件邮箱）")
+    login = env["SMTP_USER"].strip()
+    infer_sender = not env.get("SMTP_FROM") and is_mailbox(login)
+    if infer_sender:
+        env["SMTP_FROM"] = login
+    else:
+        field("SMTP_FROM", "该 SMTP 账号已获准使用的发件邮箱")
+    sender = env["SMTP_FROM"].strip()
+    if not is_mailbox(sender):
+        raise ValueError("请在 SMTP_FROM 填写有效的发件邮箱。")
     field("SMTP_PASSWORD", "SMTP 授权码", hidden=True)
-    field("RECIPIENT_EMAIL", "共享早晚报收件邮箱", env["SMTP_USER"])
+    if not env.get("RECIPIENT_EMAIL") and not sys.stdin.isatty():
+        additions["RECIPIENT_EMAIL"] = env["RECIPIENT_EMAIL"] = sender
+    else:
+        field("RECIPIENT_EMAIL", "共享早晚报收件邮箱", sender)
+    if not is_mailbox(env["RECIPIENT_EMAIL"].strip()):
+        raise ValueError("请在 RECIPIENT_EMAIL 填写有效的共享收件邮箱。")
+    if additions and infer_sender:
+        additions["SMTP_FROM"] = sender
     if not ENV.exists():
         # The existing shared scheduler sources this file for each slot, including on restarts.
         additions = {name: env[name] for name in CONFIG_KEYS if env.get(name)}

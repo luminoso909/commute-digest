@@ -22,14 +22,22 @@ struct DigestFeedChecks {
         let link = try require(DigestLink(widgetURL: require(evening.link.widgetURL)))
         let target = try require(link.browserURL(origin: require(URL(string: "https://news.example"))))
         precondition(target.absoluteString == "https://news.example/?issue=42&mode=focus&lang=en")
+        let origin = try require(URL(string: "https://news.example"))
+        precondition(DigestLink.destination(for: DigestLink.homeWidgetURL, origin: origin) == origin)
+        let issueWidgetURL = try require(evening.link.widgetURL)
+        precondition(DigestLink.destination(for: issueWidgetURL, origin: origin) == target)
+        precondition(DigestLink.destination(for: DigestLink.homeWidgetURL, origin: SiteConnection.defaultOrigin)?.scheme == "https")
         for route in [
             "https://issue?issue=42&mode=focus&lang=en",
             "commute-digest-widget://remote?issue=42&mode=focus&lang=en",
             "commute-digest-widget://issue?issue=42&mode=cross&lang=en&mode=focus",
             "commute-digest-widget://issue?issue=-42&mode=focus&lang=en",
+            "commute-digest-widget://home?url=https://other.example",
+            "commute-digest-widget://user@home",
         ] {
             let url = try require(URL(string: route))
             precondition(DigestLink(widgetURL: url) == nil)
+            precondition(DigestLink.destination(for: url, origin: origin) == nil)
         }
 
         let nextEvening = try date("2026-11-24T17:10:00+08:00")

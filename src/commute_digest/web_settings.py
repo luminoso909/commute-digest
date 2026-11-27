@@ -3,6 +3,7 @@
 import base64
 from hashlib import sha256
 from html import escape
+import os
 import re
 
 import streamlit as st
@@ -239,6 +240,9 @@ def _appearance(account: accounts.Account | None, color: str, mode: str) -> None
         chosen = color if selected == preset else ACCENTS[preset]
     scheme = st.radio("显示模式", ("light", "dark"), index=int(mode == "dark"),
                       format_func={"light": "日间", "dark": "夜间"}.get, horizontal=True)
+    st.link_button("下载 Mac 小组件安装包",
+                   "https://github.com/luminoso909/commute-digest/releases/latest/download/CommuteDigest-macOS.zip",
+                   icon=":material/download:")
     with st.container(key="settings_actions", horizontal=True, horizontal_alignment="right"):
         save = st.button("保存", type="primary", key="save_appearance")
         if st.button("返回", key="cancel_appearance"):
@@ -377,3 +381,6 @@ def sidebar(account: accounts.Account | None, mode: str, lang: str) -> None:
                 return
             st.query_params.from_dict({"issue": str(issue["id"]), "mode": mode, "lang": lang})
             st.rerun()
+        if account and os.getenv("COMMUTE_DEBUG_DELIVERY") == "1":
+            from .debug_delivery import render_button
+            render_button(account)

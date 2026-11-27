@@ -117,7 +117,7 @@ private struct DigestView: View {
         .containerBackground(for: .widget) {
             Rectangle().fill(.background)
         }
-        .widgetURL(entry.isPreview ? nil : entry.feed?.link.widgetURL)
+        .widgetURL(entry.isPreview ? nil : (entry.feed?.link.widgetURL ?? DigestLink.homeWidgetURL))
     }
 
     private func titles(_ titles: [String], fontSize: CGFloat, spacing: CGFloat, lineLimit: Int? = nil) -> some View {
@@ -142,7 +142,7 @@ struct HeadlinesWidget: Widget {
         StaticConfiguration(kind: kind, provider: DigestTimeline()) { entry in
             DigestView(entry: entry)
         }
-        .configurationDisplayName("通勤晨报")
+        .configurationDisplayName("通勤日报")
         .description("打开最近投送的晨报或晚报。")
         .supportedFamilies([.systemLarge])
     }

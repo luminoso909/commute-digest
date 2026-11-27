@@ -99,6 +99,7 @@ struct DigestFeed: Codable {
 
 struct DigestLink {
     static let scheme = "commute-digest-widget"
+    static let homeWidgetURL = URL(string: "\(scheme)://home")!
 
     let issueID: Int64
     let mode: DigestMode
@@ -152,6 +153,12 @@ struct DigestLink {
         url.path = "/"
         url.queryItems = query
         return url.url
+    }
+
+    static func destination(for widgetURL: URL, origin: URL) -> URL? {
+        guard let origin = SiteConnection.approvedOrigin(origin.absoluteString) else { return nil }
+        if widgetURL == homeWidgetURL { return origin }
+        return DigestLink(widgetURL: widgetURL)?.browserURL(origin: origin)
     }
 }
 

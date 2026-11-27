@@ -11,6 +11,8 @@ __pycache__/
 .DS_Store
 xcuserdata/
 DerivedData/
+/dist/
+/dist/
 data/
 *.keys/
 /static/widget-latest.json
