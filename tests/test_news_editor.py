@@ -182,11 +182,7 @@ def test_digest_only_uses_recent_api_sources_and_deduplicates(monkeypatch):
     assert first_result["perspective"]["source_url"] == "https://news.example/with-byline"
     assert fetched_result["source_name"] == "example.org"
     assert fetched_result["published_at"] == "2026-11-21T08:10:00+00:00"
-    assert report["focus"] == [
-        first_result,
-        {**fetched_result, "supplemental": True},
-        {**last_result, "supplemental": True},
-    ]
+    assert report["focus"] == [first_result]
 
 
 def test_only_exact_times_in_the_window_are_eligible():
@@ -386,7 +382,7 @@ def test_sparse_focus_and_unverified_attribution(monkeypatch):
     report = news_editor.generate_digest([news_editor.CATEGORIES[2]], [], now=NOW)
 
     assert "perspective" not in report["cross"][0]
-    assert report["focus"] == [{**article, "supplemental": True} for article in report["cross"]]
+    assert report["focus"] == []
 
 
 def test_keyword_only_focus_requires_evidence_in_the_story(monkeypatch):
@@ -400,21 +396,48 @@ def test_keyword_only_focus_requires_evidence_in_the_story(monkeypatch):
             news_source("model", snippet="新AI模型已发布。"),
             news_source("chip"),
         ),
-        {"cross": [rail, ai, chip], "focus": [rail, ai, chip]},
+        {"cross": [rail, ai, chip], "focus": ["S2"]},
     )
 
     report = news_editor.generate_digest([], ["ai", "芯片"], now=NOW)
-    assert [item["source_url"] for item in report["focus"] if not item.get("supplemental")] == [
+    assert [item["source_url"] for item in report["focus"]] == [
         "https://news.example/model",
         "https://news.example/chip",
     ]
-    assert all(
-        item["supplemental"] for item in news_editor.generate_digest([], ["遥感"], now=NOW)["focus"]
-    )
+    assert news_editor.generate_digest([], ["遥感"], now=NOW)["focus"] == []
     assert (
         len(news_editor.generate_digest([news_editor.CATEGORIES[0]], ["遥感"], now=NOW)["focus"])
         == 3
     )
+
+
+def test_focus_uses_matching_cross_candidates_and_prioritizes_keywords(monkeypatch):
+    topic, other = news_editor.CATEGORIES[:2]
+    install_responses(
+        monkeypatch,
+        research_response(
+            news_source("first"), news_source("battery", snippet="新电池完成寿命测试。"),
+            news_source("third"), news_source("other", snippet="电池订单翻倍。"),
+        ),
+        {"cross": [entry("S1", "first", topic, importance=3), entry("S2", "battery", topic),
+                   entry("S3", "third", topic), entry("S4", "other", other)],
+         "focus": ["S1", "S4"]},
+    )
+    report = news_editor.generate_digest([topic], ["电池"], now=NOW, required_mode="focus")
+    assert [item["event_key"] for item in report["focus"]] == ["battery", "first", "third"]
+
+
+def test_required_focus_retries_before_rejecting_sparse_issue(monkeypatch):
+    requests = install_responses(
+        monkeypatch,
+        research_response(news_source("one"), news_source("two"), news_source("three")),
+        {"cross": [entry("S1", "one"), entry("S2", "two"),
+                   entry("S3", "three", category=news_editor.CATEGORIES[1])],
+         "focus": ["S1"]},
+    )
+    with pytest.raises(news_editor.EditorError, match="至少 3 条匹配个人偏好"):
+        news_editor.generate_digest([news_editor.CATEGORIES[0]], [], now=NOW, required_mode="focus")
+    assert [path for path, _ in requests] == ["/responses", "/chat/completions"] * 2
 
 
 def test_perspective_requires_a_full_author_name(monkeypatch):

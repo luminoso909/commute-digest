@@ -8,10 +8,11 @@ private struct DigestEntry: TimelineEntry {
 }
 
 private struct DigestTimeline: TimelineProvider {
-    private static let cacheKey = "latest-delivered-digest-v1"
+    private static let cacheKey = "personal-delivered-digest-v2"
 
     private struct CachedFeed: Codable {
         let origin: URL
+        let accountID: String
         let data: Data
     }
 
@@ -20,21 +21,28 @@ private struct DigestTimeline: TimelineProvider {
     }
 
     func getSnapshot(in context: Context, completion: @escaping (DigestEntry) -> Void) {
-        let current = context.isPreview ? example : cached(for: (try? DigestKeychain.read())?.origin)
+        let current = context.isPreview ? example : cached(for: try? DigestKeychain.read())
         completion(DigestEntry(date: .now, feed: current, isPreview: context.isPreview))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<DigestEntry>) -> Void) {
         Task {
             let credentials = try? DigestKeychain.read()
-            var latest = cached(for: credentials?.origin)
-            if let credentials,
-               let fetched = try? await DigestFeedClient.fetch(using: credentials),
-               latest.map({ fetched.slot >= $0.slot }) ?? true {
-                latest = fetched
-                if let data = try? fetched.encoded(),
-                   let record = try? JSONEncoder().encode(CachedFeed(origin: credentials.origin, data: data)) {
-                    UserDefaults.standard.set(record, forKey: Self.cacheKey)
+            var latest = cached(for: credentials)
+            if let credentials {
+                do {
+                    latest = try await DigestFeedClient.fetch(using: credentials)
+                    if let data = try latest?.encoded() {
+                        let record = CachedFeed(origin: credentials.origin, accountID: credentials.accountID, data: data)
+                        UserDefaults.standard.set(try JSONEncoder().encode(record), forKey: Self.cacheKey)
+                    } else {
+                        UserDefaults.standard.removeObject(forKey: Self.cacheKey)
+                    }
+                } catch DigestFeedError.invalidCredentials {
+                    latest = nil
+                    UserDefaults.standard.removeObject(forKey: Self.cacheKey)
+                } catch {
+                    // A transient outage can use this account's last successful response.
                 }
             }
             let now = Date()
@@ -43,10 +51,15 @@ private struct DigestTimeline: TimelineProvider {
         }
     }
 
-    private func cached(for origin: URL?) -> DigestFeed? {
+    private func cached(for credentials: SiteConnection?) -> DigestFeed? {
+        UserDefaults.standard.removeObject(forKey: "latest-delivered-digest-v1")
+        guard let credentials else {
+            UserDefaults.standard.removeObject(forKey: Self.cacheKey)
+            return nil
+        }
         guard let data = UserDefaults.standard.data(forKey: Self.cacheKey),
               let record = try? JSONDecoder().decode(CachedFeed.self, from: data),
-              origin == nil || origin == record.origin
+              credentials.origin == record.origin, credentials.accountID == record.accountID
         else { return nil }
         return try? DigestFeed.decode(record.data)
     }
@@ -55,7 +68,7 @@ private struct DigestTimeline: TimelineProvider {
         let calendar = BeijingSchedule.calendar
         let date = calendar.startOfDay(for: .now).addingTimeInterval(5 * 3_600)
         return DigestFeed(
-            issueID: 1,
+            issueID: 1, issueNumber: 1,
             slot: date,
             edition: .morning,
             mode: .cross,

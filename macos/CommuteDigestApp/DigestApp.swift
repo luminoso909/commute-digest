@@ -87,7 +87,7 @@ private final class DigestAppDelegate: NSObject, NSApplicationDelegate {
             settingsWindow.makeKeyAndOrderFront(nil)
         } else {
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 420, height: 180),
+                contentRect: NSRect(x: 0, y: 0, width: 420, height: 270),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false
@@ -105,6 +105,9 @@ private final class DigestAppDelegate: NSObject, NSApplicationDelegate {
 
 private struct ConnectionSettings: View {
     @State private var address = SettingsStore.origin?.absoluteString ?? ""
+    @State private var accountID = ""
+    @State private var password = ""
+    @State private var connected = false
     @State private var status = ""
     @State private var busy = false
 
@@ -114,16 +117,30 @@ private struct ConnectionSettings: View {
                 .font(.title2.weight(.semibold))
             TextField("日报网址", text: $address, prompt: Text("https://…"))
                 .disabled(busy)
+            TextField("用户 ID", text: $accountID, prompt: Text("8 位用户 ID")).disabled(busy)
+            SecureField("账号密码", text: $password).disabled(busy)
             HStack {
                 Text(status)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if connected {
+                    Button("退出登录") {
+                        do {
+                            try DigestKeychain.clear()
+                            password = ""
+                            connected = false
+                            status = "已退出小组件账号。"
+                            WidgetCenter.shared.reloadTimelines(ofKind: SettingsStore.widgetKind)
+                        } catch { status = error.localizedDescription }
+                    }
+                    .disabled(busy)
+                }
                 Button(busy ? "正在连接…" : "验证并保存") {
                     Task { await connect() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(busy || address.isEmpty)
+                .disabled(busy || address.isEmpty || accountID.isEmpty || password.isEmpty)
             }
         }
         .padding(24)
@@ -131,7 +148,9 @@ private struct ConnectionSettings: View {
         .task {
             if let existing = try? DigestKeychain.read() {
                 address = existing.origin.absoluteString
-                await connect()
+                accountID = existing.accountID
+                password = existing.password
+                connected = true
             }
         }
     }
@@ -142,10 +161,11 @@ private struct ConnectionSettings: View {
         busy = true
         defer { busy = false }
         do {
-            let connection = try SiteConnection(baseURL: address)
+            let connection = try SiteConnection(baseURL: address, accountID: accountID, password: password)
             let feed = try await DigestFeedClient.fetch(using: connection)
             try SettingsStore.save(connection)
-            status = feed.map { "已连接，已读取第 \($0.issueID) 期。" } ?? "已连接，等待首次投送。"
+            connected = true
+            status = feed.map { "已连接，已读取个人第 \($0.issueNumber) 期。" } ?? "已连接，等待首次个人投送。"
         } catch let error as DigestFeedError {
             status = error.localizedDescription
         } catch let error as CredentialError {

@@ -3,20 +3,30 @@ import Security
 
 struct SiteConnection: Codable, Equatable {
     let origin: URL
+    let accountID: String
+    let password: String
+
     enum CodingKeys: String, CodingKey {
         case origin = "baseURL"
+        case accountID, password
     }
 
-    init(baseURL: String) throws {
-        guard let origin = Self.approvedOrigin(baseURL.trimmingCharacters(in: .whitespacesAndNewlines))
+    init(baseURL: String, accountID: String, password: String) throws {
+        let identifier = accountID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard let origin = Self.approvedOrigin(baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              identifier.range(of: #"^[A-Z0-9]{8}$"#, options: .regularExpression) != nil,
+              !password.isEmpty
         else { throw CredentialError.invalidInput }
         self.origin = origin
+        self.accountID = identifier
+        self.password = password
     }
 
     init(from decoder: Decoder) throws {
-        // Earlier versions stored extra fields alongside the website URL.
         let data = try decoder.container(keyedBy: CodingKeys.self)
-        try self.init(baseURL: data.decode(String.self, forKey: .origin))
+        try self.init(baseURL: data.decode(String.self, forKey: .origin),
+                      accountID: data.decode(String.self, forKey: .accountID),
+                      password: data.decode(String.self, forKey: .password))
     }
 
     static func approvedOrigin(_ baseURL: String) -> URL? {
@@ -36,7 +46,7 @@ enum CredentialError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidInput: return "请填写日报的 HTTPS 网址。"
+        case .invalidInput: return "请填写日报的 HTTPS 网址、8 位用户 ID 和账号密码。"
         case .keychain, .keychainMismatch: return "无法访问 macOS 钥匙串。请解锁登录钥匙串后重试。"
         case .missingTargets: return "找不到安装包内的小组件，请重新安装宿主 App。"
         }
@@ -64,7 +74,8 @@ enum DigestKeychain {
         guard status == errSecSuccess, let data = value as? Data else {
             throw CredentialError.keychain(status)
         }
-        return try JSONDecoder().decode(SiteConnection.self, from: data)
+        // URL-only installations retain their address in SettingsStore and must sign in once.
+        return try? JSONDecoder().decode(SiteConnection.self, from: data)
     }
 
     static func save(_ credentials: SiteConnection) throws {
@@ -76,11 +87,16 @@ enum DigestKeychain {
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
             var item = query.merging(attributes) { _, new in new }
-            item[kSecAttrLabel as String] = "通勤日报网址"
+            item[kSecAttrLabel as String] = "通勤日报小组件账号"
             try check(SecItemAdd(item as CFDictionary, nil))
         } else {
             try check(status)
         }
+    }
+
+    static func clear() throws {
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecItemNotFound { try check(status) }
     }
 
     private static func packagedAppAccess() throws -> SecAccess {

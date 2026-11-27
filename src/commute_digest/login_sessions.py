@@ -1,5 +1,7 @@
 """Remember a verified login across Streamlit WebSocket connections."""
 
+import base64
+from binascii import Error as Base64Error
 from contextlib import contextmanager
 from hashlib import sha256
 import json
@@ -10,11 +12,11 @@ from urllib.parse import urlsplit
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 import streamlit as st
 
-from . import accounts
+from . import accounts, edition_service
 
 COOKIE = "__Host-commute-login"
 LOCAL_COOKIE = "commute-login-local"
@@ -110,7 +112,42 @@ async def session_route(request: Request) -> Response:
     return response
 
 
-ROUTES = [Route(PATH, session_route, methods=["POST"])]
+async def widget_feed_route(request: Request) -> Response:
+    """A widget authenticates with its own account; the browser may use its login cookie."""
+    headers = {"Cache-Control": "private, no-store", "Vary": "Authorization, Cookie"}
+    account_id = None
+    authorization = request.headers.get("authorization", "")
+    if authorization:
+        scheme, _, encoded = authorization.partition(" ")
+        if scheme.lower() == "basic" and len(encoded) <= 2048:
+            try:
+                identifier, password = base64.b64decode(encoded, validate=True).decode().split(":", 1)
+            except (Base64Error, ValueError):
+                pass
+            else:
+                account = await run_in_threadpool(accounts.authenticate, identifier, password)
+                if account is not None:
+                    account_id = account.id
+    else:
+        token = request.cookies.get(COOKIE) or request.cookies.get(LOCAL_COOKIE, "")
+        session = await run_in_threadpool(by_cookie, token)
+        if session is not None:
+            account_id = session["account_id"]
+    if account_id is None:
+        return Response(status_code=401, headers=headers)
+    issue = await run_in_threadpool(edition_service.latest_widget_issue, account_id)
+    return JSONResponse(issue, headers=headers)
+
+
+async def retired_widget_feed(request: Request) -> Response:
+    return Response(status_code=410, headers={"Cache-Control": "no-store"})
+
+
+ROUTES = [
+    Route(PATH, session_route, methods=["POST"]),
+    Route("/account/widget-feed", widget_feed_route),
+    Route("/app/static/widget-latest.json", retired_widget_feed),
+]
 
 
 def remember(account_id: int) -> None:

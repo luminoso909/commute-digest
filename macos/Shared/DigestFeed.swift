@@ -57,6 +57,7 @@ enum BeijingSchedule {
 
 struct DigestFeed: Codable {
     let issueID: Int64
+    let issueNumber: Int
     let slot: Date
     let edition: DigestEdition
     let mode: DigestMode
@@ -65,6 +66,7 @@ struct DigestFeed: Codable {
 
     enum CodingKeys: String, CodingKey {
         case issueID = "issue_id"
+        case issueNumber = "issue_number"
         case slot, edition, mode, language, titles
     }
 
@@ -72,8 +74,8 @@ struct DigestFeed: Codable {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let feed = try decoder.decode(Self?.self, from: data) else { return nil }
-        guard feed.issueID > 0, BeijingSchedule.edition(for: feed.slot) == feed.edition,
-              (3...6).contains(feed.titles.count),
+        guard feed.issueID > 0, feed.issueNumber > 0, BeijingSchedule.edition(for: feed.slot) == feed.edition,
+              (1...6).contains(feed.titles.count),
               feed.titles.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
         else { throw DigestFeedError.invalidFeed }
         return feed
@@ -159,7 +161,7 @@ enum DigestFeedError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidFeed: return "服务器返回的标题数据无法读取。"
-        case .invalidCredentials: return "日报网址需要授权，请检查服务器的公开标题入口。"
+        case .invalidCredentials: return "用户 ID 或密码有误，请重新登录。"
         case .unavailable: return "暂时无法连接日报网页。"
         }
     }
@@ -180,9 +182,11 @@ private final class StayOnEndpoint: NSObject, URLSessionTaskDelegate {
 enum DigestFeedClient {
     static func fetch(using credentials: SiteConnection) async throws -> DigestFeed? {
         var request = URLRequest(
-            url: credentials.origin.appending(path: "app/static/widget-latest.json"),
+            url: credentials.origin.appending(path: "account/widget-feed"),
             cachePolicy: .reloadIgnoringLocalCacheData
         )
+        let login = Data("\(credentials.accountID):\(credentials.password)".utf8).base64EncodedString()
+        request.setValue("Basic \(login)", forHTTPHeaderField: "Authorization")
         request.setValue("true", forHTTPHeaderField: "ngrok-skip-browser-warning")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let configuration = URLSessionConfiguration.ephemeral

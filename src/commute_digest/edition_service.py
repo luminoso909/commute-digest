@@ -16,7 +16,6 @@ from email.headerregistry import Address
 from email.message import EmailMessage
 from html import escape
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import NotRequired, TypedDict
 from urllib.parse import urlencode, urlsplit
 
@@ -45,6 +44,7 @@ class Preferences(TypedDict):
 
 class Issue(TypedDict):
     id: int
+    issue_number: NotRequired[int]
     created_at: str
     cross: list[dict]
     focus: list[dict]
@@ -54,8 +54,15 @@ class Issue(TypedDict):
     window_end: NotRequired[str]
 
 
+class ArchiveIssue(TypedDict):
+    issue: Issue
+    article_indices: list[int]
+    is_latest: bool
+
+
 class WidgetIssue(TypedDict):
     issue_id: int
+    issue_number: int
     slot: str
     edition: str
     mode: str
@@ -82,6 +89,46 @@ class MailSettings:
     public_url: str
 
 
+def _initialize_account_issues(connection: sqlite3.Connection) -> None:
+    """Migrate known recipients once. Unattributed system issues stay in storage."""
+    exists = "SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_issues'"
+    if connection.execute(exists).fetchone():
+        return
+    with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute(exists).fetchone():
+            return
+        connection.execute("""
+            CREATE TABLE account_issues (
+                account_id INTEGER NOT NULL REFERENCES accounts(id),
+                issue_number INTEGER NOT NULL CHECK (issue_number > 0),
+                issue_id INTEGER NOT NULL REFERENCES issues(id),
+                PRIMARY KEY (account_id, issue_number),
+                UNIQUE (account_id, issue_id)
+            )
+        """)
+        connection.execute("CREATE INDEX account_issues_by_issue ON account_issues(issue_id)")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "accounts" not in tables:
+            return
+        sources = []
+        if "issue_owners" in tables:
+            sources.append("SELECT account_id, issue_id FROM issue_owners")
+        # A pre-upgrade subscription ledger can survive alongside the current one.
+        for table in ("subscription_deliveries", "subscription_deliveries_v1"):
+            if table in tables:
+                sources.append(f"SELECT account_id, issue_id FROM {table} WHERE status='sent'")
+        if sources:
+            connection.execute(f"""
+                WITH recipients AS ({" UNION ".join(sources)})
+                INSERT INTO account_issues (account_id, issue_number, issue_id)
+                SELECT account_id, row_number() OVER (PARTITION BY account_id ORDER BY issue_id), issue_id
+                FROM (SELECT DISTINCT account_id, issue_id FROM recipients) AS known
+                JOIN accounts ON accounts.id = known.account_id
+                JOIN issues ON issues.id = known.issue_id
+            """)
+
+
 @contextmanager
 def _database() -> Iterator[sqlite3.Connection]:
     database = Path(os.getenv("COMMUTE_DB") or "data/morning.sqlite3")
@@ -99,10 +146,6 @@ def _database() -> Iterator[sqlite3.Connection]:
                     created_at TEXT NOT NULL,
                     payload TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS issue_owners (
-                    issue_id INTEGER PRIMARY KEY REFERENCES issues(id),
-                    account_id INTEGER NOT NULL
-                );
                 CREATE TABLE IF NOT EXISTS deliveries (
                     day TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
@@ -115,6 +158,7 @@ def _database() -> Iterator[sqlite3.Connection]:
                 );
                 """
             )
+            _initialize_account_issues(connection)
             with connection:
                 yield connection
     except (OSError, sqlite3.Error) as exc:
@@ -166,7 +210,7 @@ def recipient_email() -> str:
     return os.getenv("RECIPIENT_EMAIL", "").strip()
 
 
-def _issue_from_payload(issue_id: int, created_at: str, payload: dict) -> Issue:
+def _issue_from_payload(issue_id: int, created_at: str, payload: dict, issue_number: int | None = None) -> Issue:
     issue: Issue = {
         "id": issue_id,
         "created_at": created_at,
@@ -174,6 +218,8 @@ def _issue_from_payload(issue_id: int, created_at: str, payload: dict) -> Issue:
         "focus": payload["focus"],
         "edition": "morning",
     }
+    if issue_number is not None:
+        issue["issue_number"] = issue_number
     if slot_text := payload.get("slot"):
         slot = datetime.fromisoformat(slot_text)
         issue["edition"] = "evening" if slot.time() == EVENING_TIME else "morning"
@@ -183,12 +229,25 @@ def _issue_from_payload(issue_id: int, created_at: str, payload: dict) -> Issue:
     return issue
 
 
+def _assign_issue(connection: sqlite3.Connection, account_id: int, issue_id: int) -> int:
+    """Allocate the next number in this reader's archive within the publishing transaction."""
+    connection.execute("""
+        INSERT INTO account_issues (account_id, issue_number, issue_id)
+        SELECT ?, COALESCE(MAX(issue_number), 0) + 1, ? FROM account_issues WHERE account_id=?
+        ON CONFLICT(account_id, issue_id) DO NOTHING
+    """, (account_id, issue_id, account_id))
+    return connection.execute(
+        "SELECT issue_number FROM account_issues WHERE account_id=? AND issue_id=?", (account_id, issue_id)
+    ).fetchone()[0]
+
+
 def _publish(
     preferences: Preferences,
     slot: datetime,
     *,
     exclude_articles: Sequence[dict] = (),
     account_id: int | None = None,
+    required_mode: str | None = None,
 ) -> Issue:
     selection = nullcontext()
     if account_id is not None:
@@ -206,7 +265,7 @@ def _publish(
                 now=slot,
                 window_start=slot - SLOT_INTERVAL,
                 exclude_articles=exclude_articles,
-                required_mode=preferences["delivery_mode"],
+                required_mode=required_mode if required_mode is not None else preferences["delivery_mode"],
             )
     except news_editor.EditorError as exc:
         raise MorningError(str(exc)) from exc
@@ -218,35 +277,43 @@ def _publish(
             "INSERT INTO issues (created_at, payload) VALUES (?, ?) RETURNING id",
             (created_at, json.dumps(payload, ensure_ascii=False)),
         ).fetchone()
-        if account_id is not None:
-            connection.execute("INSERT INTO issue_owners VALUES (?, ?)", (row[0], account_id))
-    return _issue_from_payload(row[0], created_at, payload)
+        issue_number = _assign_issue(connection, account_id, row[0]) if account_id is not None else None
+    return _issue_from_payload(row[0], created_at, payload, issue_number)
 
 
-def publish(*, account_id: int | None = None) -> Issue:
+def publish(*, account_id: int | None = None, required_mode: str | None = None) -> Issue:
+    if required_mode is not None and required_mode not in {"cross", "focus"}:
+        raise MorningError("请选择有效的阅读版式。")
     slot = latest_slot(datetime.now(BEIJING))
     if account_id is None:
-        return _publish(get_preferences(), slot)
+        return _publish(get_preferences(), slot, required_mode=required_mode)
 
     from . import accounts
 
     account = accounts.get_account(account_id)
     if account is None:
         raise MorningError("请重新登录后再生成简报。")
-    return _publish(account.preferences, slot, account_id=account.id)
+    return _publish(account.preferences, slot, account_id=account.id, required_mode=required_mode)
 
 
 _VISIBLE_ISSUES = """
-    SELECT issues.id, created_at, payload FROM issues
-    LEFT JOIN issue_owners ON issue_owners.issue_id = issues.id
-    WHERE (issue_owners.account_id IS NULL OR issue_owners.account_id = ?)
+    SELECT issues.id, created_at, payload, account_issues.issue_number FROM issues
+    JOIN account_issues ON account_issues.issue_id = issues.id
+    WHERE account_issues.account_id = ?
+"""
+
+_ISSUE_RECENCY = """
+    julianday(COALESCE(json_extract(payload, '$.slot'), created_at)) DESC,
+    julianday(created_at) DESC, id DESC
 """
 
 
 def list_issues(
     *, account_id: int | None = None, offset: int = 0, limit: int = 15, mode: str | None = None,
 ) -> list[Issue]:
-    """Page shared and owned issues together. Older issues may predate the slot field."""
+    """Page only this reader's archive. Older issues may predate the slot field."""
+    if account_id is None:
+        return []
     if offset < 0 or not 1 <= limit <= 100:
         raise MorningError("无效的历史页码。")
     if mode is not None and mode not in {"focus", "cross"}:
@@ -258,17 +325,98 @@ def list_issues(
         parameters.append(f"$.{mode}")
     with _database() as connection:
         rows = connection.execute(
-            query + """
-            ORDER BY julianday(COALESCE(json_extract(payload, '$.slot'), created_at)) DESC,
-                     julianday(created_at) DESC, issues.id DESC
-            LIMIT ? OFFSET ?
+            query + f" ORDER BY {_ISSUE_RECENCY} LIMIT ? OFFSET ?",
+            (*parameters, limit, offset),
+        ).fetchall()
+    return [_issue_from_payload(issue_id, created, json.loads(payload), number)
+            for issue_id, created, payload, number in rows]
+
+
+def archive_issue_numbers(*, account_id: int | None = None, mode: str = "cross") -> dict[int, int]:
+    """Return permalink IDs and their display numbers for this reader and edition."""
+    if account_id is None:
+        return {}
+    if mode not in ("cross", "focus"):
+        raise ValueError("Unknown archive mode")
+    with _database() as connection:
+        rows = connection.execute(
+            f"SELECT id, issue_number FROM ({_VISIBLE_ISSUES})"
+            f" WHERE json_array_length(payload, ?) > 0 ORDER BY {_ISSUE_RECENCY}",
+            (account_id, f"$.{mode}"),
+        )
+        return dict(rows)
+
+
+def archive_issue_ids(*, account_id: int | None = None, mode: str = "cross") -> list[int]:
+    return list(archive_issue_numbers(account_id=account_id, mode=mode))
+
+
+def search_archive(
+    *, account_id: int | None = None, mode: str = "cross", language: str = "zh",
+    keyword: str = "", issue_id: int | None = None, edition: str | None = None,
+    category: str | None = None, order: str = "desc", offset: int = 0, limit: int = 15,
+) -> list[ArchiveIssue]:
+    """Filter visible stories, preserving their permalink indices, then paginate by issue."""
+    if account_id is None:
+        return []
+    if mode not in ("cross", "focus") or language not in ("zh", "en"):
+        raise ValueError("Unknown archive mode or language")
+    if order not in ("asc", "desc") or edition not in (None, "morning", "evening"):
+        raise ValueError("Unknown archive order or edition")
+    if offset < 0 or limit < 0:
+        raise ValueError("Invalid archive pagination")
+    if issue_id is not None and not 1 <= issue_id <= MAX_ISSUE_ID:
+        return []
+
+    filters = []
+    mode_path = f"$.{mode}"
+    parameters = [account_id, mode_path, mode_path]
+    if issue_id is not None:
+        filters.append("ranked.id = ?")
+        parameters.append(issue_id)
+    if edition:
+        # Publication slots are stored in Beijing time. Older unslotted issues are morning issues.
+        filters.append("CASE WHEN substr(json_extract(payload, '$.slot'), 12, 5) = ? "
+                       "THEN 'evening' ELSE 'morning' END = ?")
+        parameters.extend([EVENING_TIME.strftime("%H:%M"), edition])
+    if category:
+        filters.append("json_extract(story.value, '$.category') = ?")
+        parameters.append(category)
+    if keyword.strip():
+        filters.append("instr(casefold(COALESCE(json_extract(story.value, ?), '')), ?) > 0")
+        parameters.extend([f"$.{language}.title", keyword.strip().casefold()])
+    where = " AND ".join(filters) or "1"
+    # Recency 1 is the newest issue in the selected edition, even when filters hide it.
+    rank_order = "ASC" if order == "desc" else "DESC"
+    with _database() as connection:
+        connection.create_function("casefold", 1, str.casefold, deterministic=True)
+        rows = connection.execute(
+            f"""
+            WITH visible AS ({_VISIBLE_ISSUES}),
+                 ranked AS (
+                     SELECT *, row_number() OVER (ORDER BY {_ISSUE_RECENCY}) AS recency
+                     FROM visible WHERE json_array_length(payload, ?) > 0
+                 )
+            SELECT ranked.id, issue_number, created_at, payload, recency, json_group_array(story.key + 1)
+            FROM ranked JOIN json_each(payload, ?) AS story
+            WHERE {where}
+            GROUP BY ranked.id ORDER BY recency {rank_order} LIMIT ? OFFSET ?
             """,
             (*parameters, limit, offset),
         ).fetchall()
-    return [_issue_from_payload(issue_id, created, json.loads(payload)) for issue_id, created, payload in rows]
+    return [
+        ArchiveIssue(
+            issue=_issue_from_payload(issue_id, created, json.loads(payload), number),
+            article_indices=sorted(json.loads(indices)),
+            is_latest=recency == 1,
+        )
+        for issue_id, number, created, payload, recency, indices in rows
+    ]
 
 
 def get_issue(issue_id: int | None = None, *, account_id: int | None = None) -> Issue | None:
+    if account_id is None:
+        return None
     if issue_id is None:
         latest = list_issues(account_id=account_id, limit=1)
         return latest[0] if latest else None
@@ -279,76 +427,63 @@ def get_issue(issue_id: int | None = None, *, account_id: int | None = None) -> 
         ).fetchone()
     if row is None:
         return None
-    return _issue_from_payload(row[0], row[1], json.loads(row[2]))
+    return _issue_from_payload(row[0], row[1], json.loads(row[2]), row[3])
 
 
-def _latest_widget_issue(connection: sqlite3.Connection) -> WidgetIssue | None:
-    rows = connection.execute(
-        """
-        SELECT deliveries.day, issues.id, delivery_editions.mode, delivery_editions.language,
-               issues.payload
-        FROM deliveries
-        JOIN delivery_editions USING (day)
-        JOIN issues ON issues.id = deliveries.issue_id
-        WHERE deliveries.status = 'sent' AND issues.id > 0
-        ORDER BY deliveries.day DESC
-        """
-    )
-    for day, issue_id, mode, language, payload in rows:
-        try:
-            slot = datetime.fromisoformat(day)
-            if not is_slot(slot) or day != slot.astimezone(BEIJING).isoformat():
+def get_unassigned_issue(issue_id: int) -> Issue | None:
+    """Internal shared-mail retry. An already owned issue can never be reused here."""
+    with _database() as connection:
+        row = connection.execute("""
+            SELECT id, created_at, payload FROM issues WHERE id=?
+            AND NOT EXISTS (SELECT 1 FROM account_issues WHERE issue_id=issues.id)
+        """, (issue_id,)).fetchone()
+    return _issue_from_payload(row[0], row[1], json.loads(row[2])) if row else None
+
+
+def latest_widget_issue(account_id: int) -> WidgetIssue | None:
+    """Read the latest successful personal delivery using its original mail preferences."""
+    from .subscription_delivery import _initialize_deliveries
+
+    _initialize_deliveries()
+    with _database() as connection:
+        rows = connection.execute(
+            """
+            SELECT d.slot, a.issue_number, i.id, d.settings_key, i.payload
+            FROM subscription_deliveries AS d
+            JOIN account_issues AS a ON a.issue_id = d.issue_id AND a.account_id = d.account_id
+            JOIN issues AS i ON i.id = a.issue_id
+            WHERE d.account_id = ? AND d.status = 'sent'
+            ORDER BY d.slot DESC
+            """,
+            (account_id,),
+        )
+        for day, number, issue_id, settings_key, payload in rows:
+            try:
+                slot = datetime.fromisoformat(day)
+                issue = json.loads(payload)
+                preferences = json.loads(settings_key)[1]
+                mode, language = preferences["delivery_mode"], preferences["delivery_language"]
+                if (mode not in ("cross", "focus") or language not in ("zh", "en") or not is_slot(slot)
+                        or issue["slot"] != day):
+                    continue
+                titles = [story[language]["title"] for story in issue[mode]]
+            except (IndexError, KeyError, TypeError, ValueError):
                 continue
-            issue = json.loads(payload)
-            if not isinstance(issue, dict) or issue.get("slot") != day:
-                continue
-            titles = [story[language]["title"] for story in issue[mode]]
-        except (KeyError, TypeError, ValueError):
-            continue
-        if 3 <= len(titles) <= 6 and all(
-            isinstance(title, str) and title.strip() for title in titles
-        ):
-            return {
-                "issue_id": issue_id,
-                "slot": day,
-                "edition": "evening" if slot.time() == EVENING_TIME else "morning",
-                "mode": mode,
-                "language": language,
-                "titles": titles,
-            }
+            if 1 <= len(titles) <= 6 and all(isinstance(t, str) and t.strip() for t in titles):
+                return {
+                    "issue_id": issue_id, "issue_number": number, "slot": day,
+                    "edition": "evening" if slot.astimezone(BEIJING).time() == EVENING_TIME else "morning",
+                    "mode": mode, "language": language, "titles": titles,
+                }
     return None
 
 
-def reconcile_widget_feed() -> WidgetIssue | None:
-    temporary_path = None
-    try:
-        with _database() as connection:
-            # Serialize rebuilds with delivery commits so an older view cannot replace a newer one.
-            connection.execute("BEGIN IMMEDIATE")
-            issue = _latest_widget_issue(connection)
-            WIDGET_FEED_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with NamedTemporaryFile(
-                dir=WIDGET_FEED_PATH.parent,
-                prefix=".widget-latest.",
-                mode="w",
-                encoding="utf-8",
-                delete=False,
-            ) as temporary:
-                temporary_path = Path(temporary.name)
-                json.dump(issue, temporary, ensure_ascii=False)
-                temporary.write("\n")
-            temporary_path.replace(WIDGET_FEED_PATH)
-        return issue
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
-def _try_reconcile_widget_feed() -> None:
-    try:
-        reconcile_widget_feed()
-    except (MorningError, OSError) as exc:
-        print(f"桌面小组件快照更新失败，可重新生成。{exc}", file=sys.stderr)
+def remove_public_widget_feed() -> None:
+    """Remove any pre-upgrade static snapshot. Fresh installs never write one."""
+    WIDGET_FEED_PATH.unlink(missing_ok=True)
+    for temporary in WIDGET_FEED_PATH.parent.glob(".widget-latest.*"):
+        if temporary.is_file():
+            temporary.unlink(missing_ok=True)
 
 
 def _stories_published_on(day: str) -> list[dict]:
@@ -357,7 +492,7 @@ def _stories_published_on(day: str) -> list[dict]:
             """
             SELECT payload FROM issues
             WHERE substr(created_at, 1, 10) = ?
-              AND NOT EXISTS (SELECT 1 FROM issue_owners WHERE issue_id = issues.id)
+              AND NOT EXISTS (SELECT 1 FROM account_issues WHERE issue_id = issues.id)
             """,
             (day,),
         ).fetchall()
@@ -414,7 +549,7 @@ def _make_message(
     mode = preferences["delivery_mode"]
     language = preferences["delivery_language"]
     issue_link = ""
-    if settings.public_url:
+    if settings.public_url and "issue_number" in issue:
         query = urlencode({"issue": issue["id"], "mode": mode, "lang": language})
         issue_link = f"{settings.public_url}/?{query}"
     if language == "en":
@@ -443,6 +578,8 @@ def _make_message(
     if verification:
         edition_label = f"{'Preview' if language == 'en' else '试刊'} · {edition}"
     subject = f"{title} · {edition_label} · {day}"
+    if number := issue.get("issue_number"):
+        edition_label += f" · Issue {number}" if language == "en" else f" · 第 {number} 期"
     heading_font = "Georgia, 'Songti SC', SimSun, serif"
     body_font = "Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif"
     body_style = "font-size:16px;line-height:1.65;margin:0"
@@ -595,13 +732,11 @@ def deliver_slot(slot: datetime | None = None, *, verification: bool = False) ->
     settings = _mail_settings()
     claimed, retry_issue_id = _claim_delivery(key)
     if not claimed:
-        if not verification:
-            _try_reconcile_widget_feed()
         return f"{slot:%Y-%m-%d %H:%M} 已有一条投递记录，详见服务日志。"
 
     try:
         preferences = get_preferences()
-        issue = get_issue(retry_issue_id) if retry_issue_id is not None else None
+        issue = get_unassigned_issue(retry_issue_id) if retry_issue_id is not None else None
         if issue is None:
             excluded = _stories_published_on(day) if verification else ()
             issue = _publish(preferences, slot, exclude_articles=excluded)
@@ -620,8 +755,6 @@ def deliver_slot(slot: datetime | None = None, *, verification: bool = False) ->
         _delivery_status(key, "send_error", issue["id"])
         raise MorningError("SMTP 未确认接收，请核对发件记录和收件箱。") from exc
     _delivery_status(key, "sent", issue["id"], preferences=None if verification else preferences)
-    if not verification:
-        _try_reconcile_widget_feed()
     return f"{slot:%Y-%m-%d %H:%M} {slot_title(slot, 'zh')}第 {issue['id']} 期已由 SMTP 接收。"
 
 
@@ -640,8 +773,8 @@ def main() -> int:
             issue = publish()
             print(f"已发布第 {issue['id']} 期。")
         elif args.command == "widget-feed":
-            widget_issue = reconcile_widget_feed()
-            print(f"已生成小组件第 {widget_issue['issue_id']} 期快照。" if widget_issue else "暂无正式投送期次。")
+            remove_public_widget_feed()
+            print("已清理旧版公开小组件快照。")
         else:
             print(deliver_slot(args.slot, verification=args.verification))
     except (MorningError, OSError) as exc:

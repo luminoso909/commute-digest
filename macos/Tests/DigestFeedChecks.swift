@@ -16,8 +16,8 @@ struct DigestFeedChecks {
         let empty = try DigestFeed.decode(Data("null".utf8))
         precondition(empty == nil)
         let inconsistent = try? feed(edition: "morning", slot: "2026-11-24T17:00:00+08:00", titles: threeTitles)
-        let tooFew = try? feed(edition: "morning", slot: "2026-11-24T05:00:00+08:00", titles: ["标题"])
-        precondition(inconsistent == nil && tooFew == nil)
+        let noTitles = try? feed(edition: "morning", slot: "2026-11-24T05:00:00+08:00", titles: [])
+        precondition(inconsistent == nil && noTitles == nil && morning.issueNumber == 2)
 
         let link = try require(DigestLink(widgetURL: require(evening.link.widgetURL)))
         let target = try require(link.browserURL(origin: require(URL(string: "https://news.example"))))
@@ -40,13 +40,13 @@ struct DigestFeedChecks {
         precondition(BeijingSchedule.refresh(after: nextEvening, latestSlot: morning.slot) == staleRetry)
         precondition(BeijingSchedule.refresh(after: nextEvening, latestSlot: evening.slot) == tomorrowMorning)
 
-        let credentials = try SiteConnection(baseURL: "https://news.example:443/")
+        let credentials = try SiteConnection(baseURL: "https://news.example:443/",
+                                             accountID: "abcd1234", password: "local-test-password")
         let restored = try JSONDecoder().decode(SiteConnection.self, from: JSONEncoder().encode(credentials))
         precondition(restored == credentials && restored.origin.absoluteString == "https://news.example")
         let legacy = Data(#"{"baseURL":"https://news.example","username":"reader","password":"old"}"#.utf8)
-        let migrated = try JSONDecoder().decode(SiteConnection.self, from: legacy)
-        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(migrated)) as? [String: String]
-        precondition(encoded == ["baseURL": "https://news.example"])
+        let migrated = try? JSONDecoder().decode(SiteConnection.self, from: legacy)
+        precondition(migrated == nil && credentials.accountID == "ABCD1234")
 
         precondition(SiteConnection.approvedOrigin("https://reader:secret@news.example") == nil)
         precondition(SiteConnection.approvedOrigin("https://news.example/unsafe") == nil)
@@ -60,7 +60,7 @@ struct DigestFeedChecks {
 
     private static func feed(edition: String, slot: String, titles: [String]) throws -> DigestFeed {
         let fields: [String: Any] = [
-            "issue_id": 42, "edition": edition, "slot": slot,
+            "issue_id": 42, "issue_number": 2, "edition": edition, "slot": slot,
             "mode": "focus", "language": "en", "titles": titles,
         ]
         return try require(DigestFeed.decode(JSONSerialization.data(withJSONObject: fields)))

@@ -14,6 +14,84 @@ MODE_LABELS = {"cross": "跨领域版", "focus": "我的关注"}
 LANGUAGE_LABELS = {"zh": "中文", "en": "English"}
 PAGES = ("订阅设置", "阅读设置", "API 设置", "界面设置", "登录信息")
 
+_EMAIL_PROVIDERS = {
+    "gmail.com": "gmail", "googlemail.com": "gmail",
+    "163.com": "163", "126.com": "126", "yeah.net": "yeah",
+    "qq.com": "qq", "vip.qq.com": "qq", "foxmail.com": "foxmail",
+    "outlook.com": "outlook", "hotmail.com": "hotmail", "live.com": "live",
+    "icloud.com": "icloud", "me.com": "icloud", "yahoo.com": "yahoo",
+    "sina.com": "sina", "sina.cn": "sina", "sohu.com": "sohu",
+    "proton.me": "proton", "protonmail.com": "proton",
+}
+
+# The script is fixed. All user data lives in escaped HTML text nodes.
+_COPY_EMAIL = """
+<script>
+(() => {
+  const profile = document.currentScript.parentElement;
+  const button = profile.querySelector(".digest-email-badge");
+  const email = profile.querySelector(".digest-email-tooltip").textContent;
+  const status = profile.querySelector(".digest-email-status");
+  let timer;
+  function copySelection() {
+    const field = document.createElement("textarea");
+    field.value = email;
+    field.readOnly = true;
+    field.style.cssText = "position:fixed;top:0;left:0;opacity:0;pointer-events:none";
+    document.body.appendChild(field);
+    try {
+      field.select();
+      return document.execCommand("copy");
+    } finally {
+      field.remove();
+      button.focus({preventScroll:true});
+    }
+  }
+  button.addEventListener("click", async () => {
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(email);
+      copied = true;
+    } catch {
+      // Local HTTP and some browser permission settings require selection-based copying.
+      try { copied = copySelection(); } catch { copied = false; }
+    }
+    clearTimeout(timer);
+    status.textContent = copied ? "已复制" : "复制失败";
+    timer = setTimeout(() => { status.textContent = ""; }, 2400);
+  });
+})();
+</script>
+"""
+
+
+def _profile_html(account: accounts.Account | None) -> str:
+    name = account.username if account else "访客"
+    if account and account.avatar:
+        encoded = base64.b64encode(account.avatar).decode("ascii")
+        avatar = f'<img src="data:image/png;base64,{encoded}" alt="">'
+    else:
+        avatar = escape(name[:1].upper())
+
+    badge = ""
+    email = account.default_email if account else ""
+    if email:
+        domain = email.rpartition("@")[2].lower()
+        provider = escape(_EMAIL_PROVIDERS.get(domain, domain))
+        badge = (
+            '<div class="digest-email-line">'
+            f'<button type="button" class="digest-email-badge" aria-label="{provider}，复制邮箱" '
+            f'aria-describedby="digest-email-address">{provider}</button>'
+            f'<span class="digest-email-tooltip" id="digest-email-address" role="tooltip">{escape(email)}</span>'
+            '<span class="digest-email-status" role="status"></span></div>'
+        )
+    elif account:
+        badge = '<span class="digest-email-empty">邮箱待设置</span>'
+    return (
+        f'<div class="digest-profile"><div class="digest-avatar" aria-hidden="true">{avatar}</div>'
+        f'<div class="digest-identity"><div class="digest-name">{escape(name)}</div>{badge}</div></div>'
+    ) + (_COPY_EMAIL if email else "")
+
 
 def open_settings(page: str) -> None:
     st.session_state["settings_open"] = True
@@ -33,11 +111,11 @@ def current_account() -> accounts.Account | None:
     return login_sessions.current_account()
 
 
-def _footer() -> bool:
-    with st.container(horizontal=True, horizontal_alignment="right"):
+def _footer(primary: str = "保存") -> bool:
+    with st.container(key="settings_actions", horizontal=True, horizontal_alignment="right"):
         # The first submit button is the form's default action on Enter.
-        save = st.form_submit_button("保存", type="primary")
-        cancel = st.form_submit_button("退出")
+        save = st.form_submit_button(primary, type="primary")
+        cancel = st.form_submit_button("返回")
     if cancel:
         _close()
     return save
@@ -55,12 +133,7 @@ def _auth() -> None:
             )
         password = st.text_input("密码", type="password", key=f"auth_password_{action}",
                                  help="至少 8 个字符。" if action == "注册" else None)
-        with st.container(horizontal=True, horizontal_alignment="right"):
-            submitted = st.form_submit_button(action, type="primary")
-            cancel = st.form_submit_button("退出")
-        if cancel:
-            _close()
-        if submitted:
+        if _footer(action):
             if action == "注册":
                 account = accounts.register(identifier, password)
             else:
@@ -80,6 +153,7 @@ def _auth() -> None:
 def _profile(account: accounts.Account) -> None:
     if st.button("退出登录", key="sign_out"):
         login_sessions.forget()
+        st.query_params.clear()
         _close()
     with st.form("profile_settings"):
         st.text_input("用户 ID", account.public_id, disabled=True)
@@ -111,7 +185,7 @@ def _subscribe(account: accounts.Account) -> None:
             "晚报时间（北京时间）", account.evening_time, step=60,
             help="17:00–次日 04:59，可清空以关闭晚报。",
         )
-        topics = st.multiselect("关注领域", news_editor.CATEGORIES, default=prefs["topics"])
+        topics = st.multiselect("关注领域", news_editor.CATEGORIES, default=prefs["topics"], placeholder="选择领域")
         words = st.text_area("关键词", "、".join(prefs["keywords"]), placeholder="用逗号或换行分隔")
         mode = st.radio("邮件版式", MODE_LABELS, index=list(MODE_LABELS).index(prefs["delivery_mode"]),
                         format_func=MODE_LABELS.get, horizontal=True)
@@ -144,6 +218,8 @@ def _reading(account: accounts.Account | None, mode: str, lang: str) -> None:
             st.session_state["guest_reading"] = (chosen_mode, chosen_lang)
         query = st.query_params.to_dict()
         query.update(mode=chosen_mode, lang=chosen_lang)
+        if chosen_mode != mode or chosen_lang != lang:
+            query.pop("page", None)
         if chosen_mode != mode:
             query.pop("article", None)
         st.query_params.from_dict(query)
@@ -163,9 +239,9 @@ def _appearance(account: accounts.Account | None, color: str, mode: str) -> None
         chosen = color if selected == preset else ACCENTS[preset]
     scheme = st.radio("显示模式", ("light", "dark"), index=int(mode == "dark"),
                       format_func={"light": "日间", "dark": "夜间"}.get, horizontal=True)
-    with st.container(horizontal=True, horizontal_alignment="right"):
+    with st.container(key="settings_actions", horizontal=True, horizontal_alignment="right"):
         save = st.button("保存", type="primary", key="save_appearance")
-        if st.button("退出", key="cancel_appearance"):
+        if st.button("返回", key="cancel_appearance"):
             _close()
     if save:
         if not re.fullmatch(r"#[0-9A-Fa-f]{6}", chosen):
@@ -222,12 +298,12 @@ def _api(account: accounts.Account) -> None:
         if key:
             with st.expander("查看本次测试使用的完整密钥"):
                 st.code(key, language="text")
-    with st.container(horizontal=True, horizontal_alignment="right"):
+    with st.container(key="settings_actions", horizontal=True, horizontal_alignment="right"):
         if st.button("保存", type="primary", key="save_selected_model"):
             accounts.save_api(account.id, model=model, api_key=key)
             st.session_state.pop("model_connection_result", None)
             _close()
-        if st.button("退出", key="cancel_selected_model"):
+        if st.button("返回", key="cancel_selected_model"):
             st.session_state.pop("model_connection_result", None)
             _close()
 
@@ -257,57 +333,47 @@ def settings_dialog(account: accounts.Account | None, mode: str, lang: str) -> N
         account = current_account()
         if account is None:
             _close()
-    page = st.radio("设置栏目", PAGES, key="settings_page", horizontal=True, label_visibility="collapsed")
-    try:
-        if page == "阅读设置":
-            _reading(account, mode, lang)
-        elif page == "界面设置":
-            _appearance(account, *appearance(account))
-        elif page == "登录信息":
-            if account:
-                _profile(account)
+    with st.container(key="settings_layout"):
+        navigation, panel = st.columns([1, 3], gap="medium")
+        page = navigation.radio("设置栏目", PAGES, key="settings_page", label_visibility="collapsed",
+                                width="stretch")
+    with panel:
+        try:
+            if page == "阅读设置":
+                _reading(account, mode, lang)
+            elif page == "界面设置":
+                _appearance(account, *appearance(account))
+            elif page == "登录信息":
+                if account:
+                    _profile(account)
+                else:
+                    _auth()
+            elif not account:
+                st.info("请先登录以保存个人设置。")
+                with st.container(key="settings_actions", horizontal=True, horizontal_alignment="right"):
+                    st.button("前往登录", on_click=open_settings, args=("登录信息",))
+                    if st.button("返回"):
+                        _close()
+            elif page == "订阅设置":
+                _subscribe(account)
             else:
-                _auth()
-        elif not account:
-            st.info("请先登录以保存个人设置。")
-            with st.container(horizontal=True, horizontal_alignment="right"):
-                st.button("前往登录", on_click=open_settings, args=("登录信息",))
-                if st.button("退出"):
-                    _close()
-        elif page == "订阅设置":
-            _subscribe(account)
-        else:
-            _api(account)
-    except (edition_service.MorningError, news_editor.EditorError) as error:
-        st.error(str(error))
+                _api(account)
+        except (edition_service.MorningError, news_editor.EditorError) as error:
+            st.error(str(error))
 
 
 def sidebar(account: accounts.Account | None, mode: str, lang: str) -> None:
     with st.sidebar:
-        name = account.username if account else "访客"
-        initials = escape(name[:1].upper())
-        if account and account.avatar:
-            encoded = base64.b64encode(account.avatar).decode("ascii")
-            avatar = f'<img src="data:image/png;base64,{encoded}" alt="">'
-        else:
-            avatar = initials
-        email = escape(account.default_email or "邮箱待设置") if account else ""
-        st.html(
-            f'<div class="digest-profile"><div class="digest-avatar">{avatar}</div>'
-            f'<div class="digest-name">{escape(name)}</div>'
-            f'<div class="digest-email">{email}</div></div>'
-        )
+        st.html('<header class="digest-masthead"><h1>通勤日报</h1></header>')
+        st.html(_profile_html(account), unsafe_allow_javascript=bool(account and account.default_email))
         st.button("设置", icon=":material/tune:", width="stretch", on_click=open_settings,
                   args=("订阅设置" if account else "登录信息",))
-        if st.button("日报发布", icon=":material/edit_note:", width="stretch", type="primary"):
-            if account is None:
-                open_settings("登录信息")
-            else:
-                try:
-                    with st.spinner("正在整理并发布本期日报…"):
-                        issue = edition_service.publish(account_id=account.id)
-                except edition_service.MorningError as error:
-                    st.error(str(error))
-                    return
-                st.query_params.from_dict({"issue": str(issue["id"]), "mode": mode, "lang": lang})
-                st.rerun()
+        if account and st.button("日报发布", icon=":material/edit_note:", width="stretch", type="primary"):
+            try:
+                with st.spinner("正在整理并发布本期日报…"):
+                    issue = edition_service.publish(account_id=account.id, required_mode=mode)
+            except edition_service.MorningError as error:
+                st.error(str(error))
+                return
+            st.query_params.from_dict({"issue": str(issue["id"]), "mode": mode, "lang": lang})
+            st.rerun()

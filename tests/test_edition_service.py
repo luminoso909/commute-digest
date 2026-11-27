@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from commute_digest import edition_service, news_editor
+from commute_digest import accounts, edition_service, news_editor
 
 WEB_ENTRY = Path(__file__).resolve().parents[1] / "src" / "commute_digest" / "web.py"
 
@@ -55,15 +55,24 @@ def sample_issue(monkeypatch, widget_storage):
     edition_service.save_preferences(["科技与 AI"], [" 机器人 ", "机器人"], "focus", "en")
 
 
-def test_publish_saves_preferences_and_permalinks(sample_issue):
-    first = edition_service.publish()
-    latest = edition_service.publish()
+@pytest.fixture
+def sample_reader(sample_issue):
+    account = accounts.register("归档读者", "reader-test-password")
+    accounts.save_api(account.id, model=account.model, api_key="test-private-key")
+    return account
+
+
+def test_publish_saves_preferences_and_permalinks(sample_reader):
+    aid = sample_reader.id
+    first = edition_service.publish(account_id=aid)
+    latest = edition_service.publish(account_id=aid)
 
     assert edition_service.get_preferences()["keywords"] == ["机器人"]
-    assert edition_service.get_issue(first["id"]) == first
-    assert edition_service.get_issue() == latest
+    assert edition_service.get_issue(first["id"], account_id=aid) == first
+    assert edition_service.get_issue(account_id=aid) == latest
+    assert (first["issue_number"], latest["issue_number"]) == (1, 2)
     assert [item["category"] for item in latest["focus"]] == ["科技与 AI"]
-    assert edition_service.get_issue(latest["id"] + 1) is None
+    assert edition_service.get_issue(latest["id"] + 1, account_id=aid) is None
 
 
 def test_archive_orders_visible_publication_slots_before_paginating(widget_storage):
@@ -83,9 +92,14 @@ def test_archive_orders_visible_publication_slots_before_paginating(widget_stora
                 payload["slot"] = slot
             connection.execute("INSERT INTO issues VALUES (?, ?, ?)", (number, created, json.dumps(payload)))
             if owner:
-                connection.execute("INSERT INTO issue_owners VALUES (?, ?)", (number, owner))
+                edition_service._assign_issue(connection, owner, number)
+            elif number in (1, 2):
+                for recipient in (11, 22):
+                    edition_service._assign_issue(connection, recipient, number)
+            else:
+                edition_service._assign_issue(connection, 22, number)
 
-    assert [item["id"] for item in edition_service.list_issues()] == [5, 2, 1]
+    assert edition_service.list_issues() == []
     assert [item["id"] for item in edition_service.list_issues(account_id=11, mode="focus")] == [2, 4, 1]
     assert [item["id"] for item in edition_service.list_issues(account_id=22, offset=1, limit=2)] == [3, 2]
     assert edition_service.get_issue(3, account_id=11) is None
@@ -119,13 +133,13 @@ def test_delivery_uses_subscriber_preferences_and_skips_a_duplicate(
     assert "已由 SMTP 接收" in edition_service.deliver_slot()
     assert "已有一条投递记录" in edition_service.deliver_slot()
 
-    issue_id = edition_service.get_issue()["id"]
     assert len(messages) == 1
     assert str(messages[0]["To"]) == mail_configuration["RECIPIENT_EMAIL"]
     body = messages[0].get_body(preferencelist=("plain",)).get_content()
     assert "Technology update" in body
     assert "Science update" not in body
-    assert f"https://digest.example.com/?issue={issue_id}&mode=focus&lang=en" in body
+    assert "?issue=" not in body and "Read this issue online" not in body
+    assert "https://example.com/technology" in body
 
 
 @pytest.mark.parametrize(
@@ -133,9 +147,9 @@ def test_delivery_uses_subscriber_preferences_and_skips_a_duplicate(
     [("cross", "zh", "跨领域版"), ("focus", "en", "My Topics")],
 )
 def test_email_preserves_article_links_and_localized_copy_in_both_alternatives(
-    sample_issue, mail_configuration, mode, language, edition_heading
+    sample_reader, mail_configuration, mode, language, edition_heading
 ):
-    issue = edition_service.publish()
+    issue = edition_service.publish(account_id=sample_reader.id)
     preferences = edition_service.get_preferences()
     preferences.update(delivery_mode=mode, delivery_language=language)
     story = issue[mode][0]
@@ -198,19 +212,22 @@ def test_delivery_retries_failed_smtp_setup_once_then_skips_after_success(
     with pytest.raises(edition_service.MorningError, match="可重试本期"):
         edition_service.deliver_slot()
     smtp.send_message.assert_not_called()
-    issue = edition_service.get_issue()
+    with edition_service._database() as connection:
+        issue_id, = connection.execute("SELECT issue_id FROM deliveries").fetchone()
+    issue = edition_service.get_unassigned_issue(issue_id)
     assert issue is not None
     with edition_service._database() as connection:
         assert connection.execute("SELECT * FROM delivery_editions").fetchall() == []
 
     assert "已由 SMTP 接收" in edition_service.deliver_slot()
-    assert edition_service.get_issue() == issue
+    with edition_service._database() as connection:
+        assert connection.execute("SELECT id FROM issues").fetchall() == [(issue_id,)]
     assert "已有一条投递记录" in edition_service.deliver_slot()
     assert connect.call_count == 2
     smtp.send_message.assert_called_once()
     sent_message = smtp.send_message.call_args.args[0]
     plain = sent_message.get_body(preferencelist=("plain",)).get_content()
-    assert f"?issue={issue['id']}&mode=focus&lang=en" in plain
+    assert "?issue=" not in plain
     with edition_service._database() as connection:
         assert connection.execute("SELECT * FROM delivery_editions").fetchall() == [
             (issue["slot"], "focus", "en"),
@@ -234,16 +251,16 @@ def test_delivery_does_not_retry_when_smtp_disconnects_during_submission(
     smtp.send_message.assert_called_once()
 
 
-def test_unusable_api_result_keeps_previous_issue(sample_issue, monkeypatch):
-    previous = edition_service.publish()
+def test_unusable_api_result_keeps_previous_issue(sample_reader, monkeypatch):
+    previous = edition_service.publish(account_id=sample_reader.id)
 
     def api_error(topics, keywords, *, now, window_start, exclude_articles, required_mode):
         raise news_editor.EditorError("DeepSeek 联网采集未完成，请重试。")
 
     monkeypatch.setattr(news_editor, "generate_digest", api_error)
     with pytest.raises(edition_service.MorningError, match="未完成"):
-        edition_service.publish()
-    assert edition_service.get_issue() == previous
+        edition_service.publish(account_id=sample_reader.id)
+    assert edition_service.get_issue(account_id=sample_reader.id) == previous
 
 
 def test_morning_evening_and_verification_have_distinct_delivery_records(
@@ -266,8 +283,8 @@ def test_morning_evening_and_verification_have_distinct_delivery_records(
         )
         connection.execute("INSERT INTO deliveries VALUES ('2026-11-24', 'sent', 1)")
 
-    assert edition_service.get_issue(1)["edition"] == "morning"
-    assert "slot" not in edition_service.get_issue(1)
+    assert edition_service.get_unassigned_issue(1)["edition"] == "morning"
+    assert "slot" not in edition_service.get_unassigned_issue(1)
     generate = Mock(wraps=news_editor.generate_digest)
     send = Mock()
     monkeypatch.setattr(news_editor, "generate_digest", generate)
@@ -287,125 +304,97 @@ def test_morning_evening_and_verification_have_distinct_delivery_records(
         "通勤晨报 · 试刊 · 跨领域版 · 2026-11-24",
         "通勤晚报 · 跨领域版 · 2026-11-24",
     ]
-    assert edition_service.get_issue(4)["window_start"] == "2026-11-24T05:00:00+08:00"
-    assert edition_service.get_issue(4)["window_end"] == "2026-11-24T17:00:00+08:00"
+    assert edition_service.get_unassigned_issue(4)["window_start"] == "2026-11-24T05:00:00+08:00"
+    assert edition_service.get_unassigned_issue(4)["window_end"] == "2026-11-24T17:00:00+08:00"
     preview_request = generate.call_args_list[1].kwargs
     assert preview_request["window_start"].isoformat() == "2026-11-23T17:00:00+08:00"
     assert preview_request["now"].isoformat() == "2026-11-24T05:00:00+08:00"
     assert legacy["cross"][0] in preview_request["exclude_articles"]
-    assert edition_service.get_issue(2)["cross"][0] in preview_request["exclude_articles"]
+    assert edition_service.get_unassigned_issue(2)["cross"][0] in preview_request["exclude_articles"]
 
 
-def test_widget_feed_rebuilds_from_canonical_sent_edition_order(widget_storage, monkeypatch):
-    morning_slot = "2026-11-24T05:00:00+08:00"
-    evening_slot = "2026-11-24T17:00:00+08:00"
+def test_widget_feed_uses_the_accounts_delivery_ledger(widget_storage):
+    import asyncio
+    from base64 import b64encode
+    from starlette.requests import Request
+    from commute_digest import accounts, login_sessions, subscription_delivery
+
+    password = "widget-password"
+    first = accounts.register("甲", password)
+    second = accounts.register("乙", password)
+    subscription_delivery._initialize_deliveries()
+    slot = "2026-11-24T17:00:00+08:00"
     next_slot = "2026-11-25T05:00:00+08:00"
+    preferences = {"delivery_mode": "focus", "delivery_language": "en"}
+    with edition_service._database() as db:
+        for issue_id, user, stamp, status in [
+            (11, first, slot, "sent"), (12, first, next_slot, "sending"),
+            (13, second, next_slot, "sent"),
+        ]:
+            selected = article("科学与环境", "example", "关注", f"Focus {issue_id}")
+            shared = article("商业与产业", "business", "跨领域", f"Across {issue_id}")
+            payload = {"slot": stamp, "cross": [shared], "focus": [selected]}
+            db.execute("INSERT INTO issues VALUES (?,?,?)", (issue_id, stamp, json.dumps(payload)))
+            edition_service._assign_issue(db, user.id, issue_id)
+            db.execute(
+                """INSERT INTO subscription_deliveries
+                   (account_id,slot,delivery_day,scheduled_at,settings_key,claim,claimed_at,status,issue_id)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (user.id, stamp, stamp[:10], stamp, json.dumps(["time", preferences]), str(issue_id),
+                 stamp, status, issue_id),
+            )
 
-    def insert_issue(connection, issue_id, slot, key, status="sent", record_edition=True):
-        payload = {
-            "slot": slot,
-            "cross": [
-                article("科技与 AI", str(i), f"跨领域新闻 {i}", f"Across {i}") for i in range(3)
-            ],
-            "focus": [
-                article("科技与 AI", str(i), f"关注新闻 {i}", f"Focus {i}") for i in range(6)
-            ],
-        }
-        connection.execute(
-            "INSERT INTO issues VALUES (?, ?, ?)", (issue_id, slot, json.dumps(payload))
-        )
-        if key is not None:
-            connection.execute("INSERT INTO deliveries VALUES (?, ?, ?)", (key, status, issue_id))
-            if record_edition:
-                connection.execute(
-                    "INSERT INTO delivery_editions VALUES (?, 'focus', 'en')", (key,)
-                )
+    def request(**headers):
+        scope = {"type": "http", "scheme": "https", "path": "/account/widget-feed",
+                 "headers": [(k.encode(), v.encode()) for k, v in headers.items()]}
+        return asyncio.run(login_sessions.widget_feed_route(Request(scope)))
 
-    edition_service.save_preferences([], [], "cross", "zh")
-    with edition_service._database() as connection:
-        insert_issue(connection, 10, evening_slot, evening_slot)
-        insert_issue(connection, 11, morning_slot, morning_slot)
-        insert_issue(connection, 12, next_slot, None)
-        insert_issue(connection, 13, next_slot, f"preview:{next_slot}")
-        insert_issue(connection, 14, next_slot, f"preview-corrected:{next_slot}")
-        insert_issue(connection, 15, next_slot, "2026-11-25")
-        insert_issue(connection, 16, next_slot, next_slot, status="send_error")
-        insert_issue(connection, 17, next_slot, "2026-11-25T17:00:00+08:00")
-        insert_issue(connection, 18, "2026-11-25T21:00:00+00:00", "2026-11-25T21:00:00+00:00")
-        insert_issue(connection, 19, next_slot, "2026-11-26T05:00:00+08:00", record_edition=False)
+    def credentials(user, value):
+        return "Basic " + b64encode(f"{user.public_id}:{value}".encode()).decode()
 
-    generate = Mock()
-    send = Mock()
-    monkeypatch.setattr(news_editor, "generate_digest", generate)
-    monkeypatch.setattr(edition_service, "_send_message", send)
-    monkeypatch.setattr(edition_service.sys, "argv", ["commute_digest", "widget-feed"])
+    for headers in [{}, {"authorization": "Basic ***"}, {"authorization": credentials(first, "incorrect")}]:
+        assert request(**headers).status_code == 401
+    response = request(authorization=credentials(first, password))
+    assert response.status_code == 200 and "no-store" in response.headers["cache-control"]
+    feed = json.loads(response.body)
+    assert (feed["issue_id"], feed["issue_number"], feed["titles"]) == (11, 1, ["Focus 11"])
+    _, grant = login_sessions.issue(second.id)
+    cookie = login_sessions.exchange(grant)
+    other = request(cookie=f"{login_sessions.COOKIE}={cookie}")
+    assert json.loads(other.body)["titles"] == ["Focus 13"]
+    assert not widget_storage.exists()
 
+
+def test_widget_feed_retirement_cleans_legacy_data(widget_storage, monkeypatch):
+    import asyncio
+    from starlette.requests import Request
+    from commute_digest import login_sessions
+
+    widget_storage.parent.mkdir()
+    widget_storage.write_text('{"titles":["legacy headline"]}')
+    temporary = widget_storage.parent / ".widget-latest.old"
+    temporary.write_text("legacy")
+    monkeypatch.setattr(edition_service.sys, "argv", ["commute-digest", "widget-feed"])
     assert edition_service.main() == 0
-    assert json.loads(widget_storage.read_text()) == {
-        "issue_id": 10,
-        "slot": evening_slot,
-        "edition": "evening",
-        "mode": "focus",
-        "language": "en",
-        "titles": [f"Focus {i}" for i in range(6)],
-    }
-    assert list(widget_storage.parent.iterdir()) == [widget_storage]
-    generate.assert_not_called()
-    send.assert_not_called()
-
-
-def test_widget_feed_empty_database_returns_null_and_migrates_without_rewriting_deliveries(
-    widget_storage,
-):
-    with edition_service.sqlite3.connect(
-        widget_storage.parent.parent / "digest.sqlite3"
-    ) as connection:
-        connection.execute(
-            "CREATE TABLE deliveries (day TEXT PRIMARY KEY, status TEXT, issue_id INTEGER)"
-        )
-        connection.execute("INSERT INTO deliveries VALUES ('2026-11-24', 'sent', 2)")
-
-    assert edition_service.reconcile_widget_feed() is None
-    assert json.loads(widget_storage.read_text()) is None
-    with edition_service._database() as connection:
-        assert connection.execute("SELECT * FROM deliveries").fetchall() == [
-            ("2026-11-24", "sent", 2)
-        ]
-        assert connection.execute("SELECT * FROM delivery_editions").fetchall() == []
-
-
-def test_widget_feed_write_failure_can_be_reconciled_without_resending(
-    widget_storage,
-    sample_issue,
-    mail_configuration,
-    monkeypatch,
-    capsys,
-):
-    stories = [article("科技与 AI", str(i), f"关注新闻 {i}", f"Focus {i}") for i in range(3)]
-    monkeypatch.setattr(
-        news_editor, "generate_digest", lambda *args, **kwargs: {"cross": stories, "focus": stories}
-    )
-    send = Mock()
-    monkeypatch.setattr(edition_service, "_send_message", send)
-    widget_storage.mkdir(parents=True)  # An existing directory prevents atomic replacement.
-
-    assert "已由 SMTP 接收" in edition_service.deliver_slot()
-    assert "快照更新失败" in capsys.readouterr().err
-    assert list(widget_storage.parent.iterdir()) == [widget_storage]
-    widget_storage.rmdir()
-    edition_service.save_preferences([], [], "cross", "zh")
-
-    assert "已有一条投递记录" in edition_service.deliver_slot()
-    send.assert_called_once()
-    assert json.loads(widget_storage.read_text())["titles"] == [f"Focus {i}" for i in range(3)]
+    assert edition_service.main() == 0
+    assert not temporary.exists() and not widget_storage.exists()
+    old = asyncio.run(login_sessions.retired_widget_feed(Request({"type": "http"})))
+    assert old.status_code == 410 and not old.body
 
 
 def test_streamlit_opens_mailing_permalink_and_switches_editions(sample_issue):
-    issue = edition_service.publish()
+    reader = accounts.register("邮件读者", "valid-test-password")
+    accounts.save_api(reader.id, model=reader.model, api_key="mail-test-key")
+    issue = edition_service.publish(account_id=reader.id)
     app = AppTest.from_file(str(WEB_ENTRY))
     app.query_params.update(issue=str(issue["id"]), mode="focus", lang="en")
     app.run()
-
+    assert not app.exception
+    assert not app.selectbox and not any("Technology update" in element.value for element in app.markdown)
+    next(button for button in app.button if button.label == "Sign in / Register").click().run()
+    app.text_input(key="login_id").set_value(reader.public_id)
+    app.text_input(key="auth_password_登录").set_value("valid-test-password")
+    next(button for button in app.button if button.label == "登录").click().run()
     assert not app.exception
     assert any("Technology update" in element.value for element in app.markdown)
     next(button for button in app.button if button.label == "设置").click().run()
@@ -418,10 +407,11 @@ def test_streamlit_opens_mailing_permalink_and_switches_editions(sample_issue):
 
 @pytest.mark.parametrize(
     ("issue_id", "message"),
-    [((1 << 63) - 1, "未找到这期晨报。"), (1 << 63, "晨报链接中的期号无效。")],
+    [((1 << 63) - 1, "你的日报中没有这一期。"), (1 << 63, "晨报链接中的期号无效。")],
 )
 def test_streamlit_validates_the_sqlite_issue_id_range(sample_issue, issue_id, message):
     app = AppTest.from_file(str(WEB_ENTRY))
+    app.session_state["account_id"] = accounts.register("登录读者", "valid-test-password").id
     app.query_params.update(issue=str(issue_id))
     app.run()
 

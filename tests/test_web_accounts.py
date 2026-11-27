@@ -40,7 +40,7 @@ def test_register_save_account_settings_and_log_in_again(reader):
     assert re.fullmatch(r"[A-Z0-9]{8}", public_id)
     item(app.text_input, "邮箱").set_value("reader@example.org")
     click(app, "保存")
-    assert not app.text_input
+    assert [field.key for field in app.text_input] == ["archive_q"]
 
     click(app, "设置")
     item(app.checkbox, "启用每日邮件投递").check()
@@ -55,7 +55,7 @@ def test_register_save_account_settings_and_log_in_again(reader):
     click(app, "设置")
     app.radio(key="settings_page").set_value("登录信息").run()
     item(app.text_input, "用户名").set_value("未保存的修改")
-    click(app, "退出")
+    click(app, "返回")
     assert accounts.get_account(user.id).username == "晨报读者"
     click(app, "设置")
     app.radio(key="settings_page").set_value("登录信息").run()
@@ -68,6 +68,7 @@ def test_register_save_account_settings_and_log_in_again(reader):
 
 
 def test_archive_detail_and_on_demand_audio(reader, monkeypatch):
+    user = accounts.register("读者", "reader-test-password", "reader@example.org")
     copy = {"title": "旧报道", "summary": "只发邮件的短摘要", "background": "旧稿的报道细节",
             "why_it_matters": "旧稿的影响分析"}
     article = {"zh": copy, "en": copy, "category": "科学与环境", "source_url": "https://example.org/a",
@@ -77,8 +78,8 @@ def test_archive_detail_and_on_demand_audio(reader, monkeypatch):
             copy["title"] = title
             slot = f"2026-11-{day}T17:00:00+08:00"
             payload = {"cross": [article], "focus": [article], "slot": slot}
-            db.execute("INSERT INTO issues (created_at, payload) VALUES (?,?)", (slot, json.dumps(payload)))
-    user = accounts.register("读者", "reader-test-password", "reader@example.org")
+            cursor = db.execute("INSERT INTO issues (created_at, payload) VALUES (?,?)", (slot, json.dumps(payload)))
+            edition_service._assign_issue(db, user.id, cursor.lastrowid)
     accounts.save_api(user.id, model=user.model, api_key="test-tts-key")
     reader.session_state["account_id"] = user.id
     synthesize = Mock(return_value=b"RIFF" + bytes(40))
@@ -110,6 +111,7 @@ def test_api_dialog_tests_cancels_saves_and_publishes_with_the_selected_model(re
     default = news_editor.DEFAULT_MODEL
     choice = "qwen-plus"
     accounts.save_api(user.id, model=default, api_key="saved-test-key")
+    accounts.save_reading(user.id, reading_mode="focus", reading_language="zh")
     reader.session_state["account_id"] = user.id
     app = reader.run()
     check = Mock()
@@ -149,7 +151,7 @@ def test_api_dialog_tests_cancels_saves_and_publishes_with_the_selected_model(re
     app.button(key="test_selected_model").click().run()
     assert "连接成功" in app.success[0].value and "new-test-key" not in app.success[0].value
     assert app.code[0].value == "new-test-key"
-    click(app, "退出")
+    click(app, "返回")
     open_api()
     assert item(app.selectbox, "模型").value == default
     assert accounts.get_api_key(user.id, choice) is None
@@ -159,6 +161,7 @@ def test_api_dialog_tests_cancels_saves_and_publishes_with_the_selected_model(re
     click(app, "保存")
 
     def generate(*args, **kwargs):
+        assert kwargs["required_mode"] == "focus"
         assert model_api.selected_model() == choice
         assert model_api.credentials(for_drafting=True) == (model_api.DASHSCOPE, "new-test-key")
         assert model_api.credentials(for_drafting=False) == (model_api.DEEPSEEK, "saved-test-key")
@@ -201,7 +204,7 @@ def test_appearance_persists_the_selected_color_and_cancels_edits(reader):
     click(app, "保存")
     assert "六位" in app.error[0].value
     item(app.text_input, "自定义色值").set_value("#C71C59")
-    click(app, "退出")
+    click(app, "返回")
     assert app.session_state["guest_appearance"] == ("#268375", "dark")
 
     open_appearance()
@@ -209,3 +212,38 @@ def test_appearance_persists_the_selected_color_and_cancels_edits(reader):
     item(app.text_input, "自定义色值").set_value("#C71C59")
     click(app, "保存")
     assert app.session_state["guest_appearance"] == ("#C71C59", "dark")
+
+
+def test_switching_accounts_loads_only_the_current_readers_settings(reader):
+    first = accounts.register("同名读者", "first-password", "first@example.org")
+    second = accounts.register("同名读者", "second-password", "second@example.org")
+    accounts.save_subscription(first.id, enabled=False, morning_time=time(6), evening_time=time(18),
+                               preferences={**first.preferences, "keywords": ["火星"]})
+    accounts.save_api(first.id, model=first.model, api_key="first-reader-only")
+    accounts.save_reading(first.id, reading_mode="focus", reading_language="en")
+    reader.session_state["account_id"] = first.id
+    reader.query_params.update(mode="focus", lang="en")
+    app = reader.run()
+
+    click(app, "设置")
+    assert item(app.text_area, "关键词").value == "火星"
+    app.radio(key="settings_page").set_value("API 设置").run()
+    assert item(app.text_input, "API 密钥").value == "first-reader-only"
+    app.radio(key="settings_page").set_value("登录信息").run()
+    assert item(app.text_input, "邮箱").value == "first@example.org"
+    click(app, "退出登录")
+    assert not app.query_params
+
+    click(app, "设置")
+    app.text_input(key="login_id").set_value(second.public_id)
+    app.text_input(key="auth_password_登录").set_value("second-password")
+    click(app, "登录")
+    click(app, "设置")
+    assert not item(app.text_area, "关键词").value
+    app.radio(key="settings_page").set_value("API 设置").run()
+    assert not item(app.text_input, "API 密钥").value
+    app.radio(key="settings_page").set_value("登录信息").run()
+    assert item(app.text_input, "邮箱").value == "second@example.org"
+    app.radio(key="settings_page").set_value("阅读设置").run()
+    assert app.radio(key="reader_mode").value == second.reading_mode
+    assert app.radio(key="reader_language").value == second.reading_language

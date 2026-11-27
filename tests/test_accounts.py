@@ -78,7 +78,7 @@ def test_profile_reading_theme_and_private_keys_are_persisted(account_storage):
     assert accounts.save_profile(account.id, username="读者", default_email="", avatar=None).avatar is None
 
 
-def test_private_issues_require_their_owner_and_preserve_shared_issues(monkeypatch):
+def test_issues_are_only_readable_through_their_account_archive(monkeypatch):
     account = accounts.register("reader_one", "reader-one-password", "reader@example.com")
     other = accounts.register("reader_two", "reader-two-password", "other@example.com")
     accounts.save_api(account.id, model=account.model, api_key="test-private-key")
@@ -88,8 +88,36 @@ def test_private_issues_require_their_owner_and_preserve_shared_issues(monkeypat
     assert edition_service.get_issue(personal["id"], account_id=account.id) == personal
     assert edition_service.get_issue(personal["id"], account_id=other.id) is None
     assert edition_service.get_issue(personal["id"]) is None
-    assert edition_service.get_issue() == shared
-    assert edition_service.get_issue(shared["id"], account_id=other.id) == shared
+    assert personal["issue_number"] == 1
+    assert edition_service.get_issue() is None
+    assert edition_service.get_issue(shared["id"], account_id=other.id) is None
+    assert edition_service.get_unassigned_issue(shared["id"]) == shared
+    assert edition_service.get_unassigned_issue(personal["id"]) is None
+
+
+def test_manual_publish_uses_reader_interests_and_selected_reading_mode(monkeypatch):
+    readers = []
+    calls = []
+
+    def generate(topics, keywords, *, required_mode, **_):
+        calls.append((topics, keywords, required_mode))
+        story = {"category": topics[0], "zh": {"title": keywords[0]}}
+        return {"cross": [story], "focus": [story]}
+
+    monkeypatch.setattr(news_editor, "generate_digest", generate)
+    for topic, word in [("科技与 AI", "开源"), ("文化与艺术", "戏剧")]:
+        reader = accounts.register("同名读者", "offline-test-password")
+        accounts.save_api(reader.id, model=reader.model, api_key="offline-test-key")
+        prefs = {**reader.preferences, "topics": [topic], "keywords": [word], "delivery_mode": "cross"}
+        accounts.save_subscription(reader.id, enabled=False, morning_time=time(5), evening_time=time(17),
+                                   preferences=prefs)
+        issue = edition_service.publish(account_id=reader.id, required_mode="focus")
+        assert issue["issue_number"] == 1 and issue["focus"][0]["zh"]["title"] == word
+        assert accounts.get_account(reader.id).preferences["delivery_mode"] == "cross"
+        readers.append((reader.id, issue["id"]))
+    assert calls == [(["科技与 AI"], ["开源"], "focus"), (["文化与艺术"], ["戏剧"], "focus")]
+    for owner, issue_id in readers:
+        assert edition_service.archive_issue_numbers(account_id=owner) == {issue_id: 1}
 
 
 def test_worker_sends_each_enabled_edition_once_at_its_own_time(monkeypatch):
